@@ -1,4 +1,4 @@
-# Установка коллектора nlbwmon (подготовка beta)
+# Установка коллектора nlbwmon (кандидат v0.1.0-beta.1 из исходников)
 
 [English](INSTALL.md) | **Русский**
 
@@ -7,7 +7,7 @@
 
 Это руководство устанавливает **новый** Python-сервис `flow_collector.py`. Он сохраняет принятые события NEW/DESTROY в SQLite WAL и отправляет обновления документов в OpenSearch через **Bulk API**. Необязательное PTR-обогащение выполняется асинхронно. **Fluent Bit для работы коллектора не нужен.**
 
-Настройка роутера: [INSTALL форка nlbwmon](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.ru.md) ([English](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.md)).
+Настройка роутера: [INSTALL форка nlbwmon](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.ru.md) ([English](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.md)).
 
 ## 1. Требования
 
@@ -56,7 +56,7 @@ systemctl status flow-collector.service; journalctl -u flow-collector.service -n
 
 ## 5. Подключение OpenWrt и проверка
 
-На роутере настройте существующую UCI-секцию `flow_export`: уникальный `router_name`, адрес коллектора и **TCP-порт 5517**. Включайте экспорт только после запуска приёмника и настройки firewall. Учитывайте особенности `mark/mask` из [INSTALL nlbwmon](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.ru.md).
+На роутере настройте существующую UCI-секцию `flow_export`: уникальный `router_name`, адрес коллектора и **TCP-порт 5517**. Включайте экспорт только после запуска приёмника и настройки firewall. Учитывайте особенности `mark/mask` из [INSTALL nlbwmon](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.ru.md).
 
 Проверьте прослушивание порта и очередь:
 
