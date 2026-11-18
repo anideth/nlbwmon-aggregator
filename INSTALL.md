@@ -1,4 +1,4 @@
-# Install the nlbwmon lifecycle collector (beta preparation)
+# Install the nlbwmon lifecycle collector (v0.1.0-beta.1 source candidate)
 
 **English** | [Русский](INSTALL.ru.md)
 
@@ -7,7 +7,7 @@
 
 This guide installs the **new** Python `flow_collector.py` service, which stores received NEW/DESTROY events in SQLite WAL and sends **Bulk API** scripted updates to OpenSearch. Optional PTR enrichment runs asynchronously. It **does not require Fluent Bit**.
 
-Router-side setup: [nlbwmon INSTALL](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.md) ([Русский](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.ru.md)).
+Router-side setup: [nlbwmon INSTALL](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.md) ([Русский](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.ru.md)).
 
 ## 1. Prerequisites
 
@@ -56,7 +56,7 @@ The example enables `--dns` (optional PTR) and uses `--password-file`. The code 
 
 ## 5. Connect OpenWrt and verify
 
-On the router, configure the fork's existing UCI `flow_export` section with a unique `router_name`, collector address and **TCP port 5517**; enable only after the collector is listening and the network firewall allows the router. Follow [nlbwmon INSTALL](https://github.com/anideth/nlbwmon/blob/docs/bilingual-beta/INSTALL.md) for the exact export and mark/mask caveats.
+On the router, configure the fork's existing UCI `flow_export` section with a unique `router_name`, collector address and **TCP port 5517**; enable only after the collector is listening and the network firewall allows the router. Follow [nlbwmon INSTALL](https://github.com/anideth/nlbwmon/blob/feature/flow-lifecycle-events/INSTALL.md) for the exact export and mark/mask caveats.
 
 Check the listener and queue:
 
