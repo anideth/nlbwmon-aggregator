@@ -7,7 +7,7 @@
 > [!CAUTION]
 > **Experimental project, not a guaranteed network-flow audit trail.** Router-to-collector TCP is unencrypted, unauthenticated, and has no application-level acknowledgement. Events may be lost. Do not use the results as the sole source for billing, investigations, or security audits. Validate configuration, OpenSearch TLS, permissions, backups, and rollback before use.
 
-**Beta preparation:** [complete installation](INSTALL.md), [end-to-end setup](docs/INSTALLATION_END_TO_END.md), [systemd deployment](docs/FLOW_COLLECTOR_DEPLOYMENT.md), [OpenWrt nlbwmon fork](https://github.com/anideth/nlbwmon). No beta tag or release has been published yet. The project uses the [MIT License](LICENSE).
+**Source-only beta candidate `v0.1.0-beta.1` (tag/Release pending):** [complete installation](INSTALL.md), [end-to-end setup](docs/INSTALLATION_END_TO_END.md), [systemd deployment](docs/FLOW_COLLECTOR_DEPLOYMENT.md), [OpenWrt nlbwmon fork](https://github.com/anideth/nlbwmon). No Git tag or GitHub Release has been published yet; this source snapshot is ready for a source-only beta without packaged binaries. The project uses the [MIT License](LICENSE).
 
 ## Why this project exists
 
@@ -19,7 +19,7 @@ The router's nlbwmon continues standard traffic accounting while also emitting `
 
 The project is maintained by a DevOps/infrastructure engineer experienced in Linux and networking, with limited formal software development experience. Python code has been developed with substantial AI-tool assistance; architecture, deployment and testing have been carried out in a personal lab. No independent security audit or broad compatibility certification has been completed.
 
-**Status: experimental / beta preparation.** Successful ingestion in a lab does not prove event completeness, correct attribution in every NAT topology, or compatibility with every OpenWrt/OpenSearch version. Intended primarily for lab and self-hosted experimentation.
+**Status: experimental beta candidate `v0.1.0-beta.1`.** Successful ingestion in a lab does not prove event completeness, correct attribution in every NAT topology, or compatibility with every OpenWrt/OpenSearch version. Intended primarily for lab and self-hosted experimentation.
 
 ## Architecture
 
