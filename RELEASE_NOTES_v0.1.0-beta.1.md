@@ -1,6 +1,6 @@
 # nlbwmon-aggregator v0.1.0-beta.1 — source-only beta
 
-> **Release candidate notes.** The annotated Git tag and GitHub Release must be created after final verification. This document does not itself publish a release.
+> **Published prerelease:** [v0.1.0-beta.1](https://github.com/anideth/nlbwmon-aggregator/releases/tag/v0.1.0-beta.1). Source archives only, no packaged binaries. This development-branch document was updated after publication; the tagged snapshot remains unchanged.
 
 Experimental Python companion to the [nlbwmon OpenWrt fork](https://github.com/anideth/nlbwmon). Receives `nlbwmon-flow-v1` NEW/DESTROY JSONL events over TCP, persists received events in SQLite WAL and forwards updates to OpenSearch using the Bulk API. Optional PTR enrichment runs asynchronously. No Fluent Bit is required for the lifecycle collector.
 
