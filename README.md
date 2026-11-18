@@ -7,7 +7,7 @@
 > [!CAUTION]
 > **Experimental project, not a guaranteed network-flow audit trail.** Router-to-collector TCP is unencrypted, unauthenticated, and has no application-level acknowledgement. Events may be lost. Do not use the results as the sole source for billing, investigations, or security audits. Validate configuration, OpenSearch TLS, permissions, backups, and rollback before use.
 
-**Source-only beta candidate `v0.1.0-beta.1` (tag/Release pending):** [complete installation](INSTALL.md), [end-to-end setup](docs/INSTALLATION_END_TO_END.md), [systemd deployment](docs/FLOW_COLLECTOR_DEPLOYMENT.md), [OpenWrt nlbwmon fork](https://github.com/anideth/nlbwmon). No Git tag or GitHub Release has been published yet; this source snapshot is ready for a source-only beta without packaged binaries. The project uses the [MIT License](LICENSE).
+**Published source-only beta [`v0.1.0-beta.1`](https://github.com/anideth/nlbwmon-aggregator/releases/tag/v0.1.0-beta.1):** [complete installation](INSTALL.md), [end-to-end setup](docs/INSTALLATION_END_TO_END.md), [systemd deployment](docs/FLOW_COLLECTOR_DEPLOYMENT.md), [OpenWrt nlbwmon fork](https://github.com/anideth/nlbwmon). The Git tag and GitHub prerelease are published without packaged binaries. The project uses the [MIT License](LICENSE).
 
 ## Why this project exists
 
@@ -19,7 +19,7 @@ The router's nlbwmon continues standard traffic accounting while also emitting `
 
 The project is maintained by a DevOps/infrastructure engineer experienced in Linux and networking, with limited formal software development experience. Python code has been developed with substantial AI-tool assistance; architecture, deployment and testing have been carried out in a personal lab. No independent security audit or broad compatibility certification has been completed.
 
-**Status: experimental beta candidate `v0.1.0-beta.1`.** Successful ingestion in a lab does not prove event completeness, correct attribution in every NAT topology, or compatibility with every OpenWrt/OpenSearch version. Intended primarily for lab and self-hosted experimentation.
+**Status: published experimental beta `v0.1.0-beta.1`.** Successful ingestion in a lab does not prove event completeness, correct attribution in every NAT topology, or compatibility with every OpenWrt/OpenSearch version. Intended primarily for lab and self-hosted experimentation.
 
 ## Architecture
 
@@ -115,4 +115,4 @@ This is **not** the new lifecycle collector installation path. The older impleme
 
 ## License and publication
 
-The project uses the [MIT License](LICENSE). Before the first public release, verify code provenance, remove secrets and private data from files and all Git history, test installation on a clean system and verify rollback. No release has been published yet.
+The project uses the [MIT License](LICENSE). For subsequent releases, continue checking code provenance and Git history for secrets and private data, and validating installation and rollback on clean systems. The first source-only beta has been published; this does not imply a completed security audit.
