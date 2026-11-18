@@ -1,0 +1,29 @@
+[Unit]
+Description=nlbwmon Flow Lifecycle Collector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=flow-collector
+Group=flow-collector
+SupplementaryGroups=flow-secrets
+WorkingDirectory=/opt/nlbwmon-aggregator
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENSEARCH_USER=writer
+ExecStart=/usr/bin/python3 /opt/nlbwmon-aggregator/flow_collector.py --listen 192.0.2.10 --port 5517 --db /opt/nlbwmon-data/flows.db --url https://search.example:9200 --ca-file /etc/ssl/certs/ca-certificates.crt --password-file /etc/flow-writer/password --dns
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/nlbwmon-data
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flow-collector
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Conntrack WAN Traffic Aggregator
+Wants=network-online.target
+After=network-online.target fluent-bit.service
+Requires=fluent-bit.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/conntrack-aggregator
+ExecStart=/usr/bin/python3 -u /opt/conntrack-aggregator/aggregator.py --listen 0.0.0.0 --port 5515 --fluent-host 127.0.0.1 --fluent-port 5516 --local-networks 192.168.10.0/24,192.168.20.0/24 --wan-addresses 203.0.113.2 --legacy-router-name home-router --interval 60 --max-groups 10000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
