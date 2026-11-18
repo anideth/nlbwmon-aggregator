@@ -3,8 +3,7 @@ name: Python checks
 on:
   push:
     branches:
-      - docs/bilingual-beta
-      - release/beta-preparation
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -26,4 +25,4 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q -f flow_collector.py flow_lifecycle.py flow_opensearch.py flow_writer.py dns_resolver.py aggregator.py
       - name: Unit tests
-        run: python -m unittest -v test_dns_resolver test_flow_lifecycle test_flow_opensearch test_flow_writer test_flow_collector test_aggregator
+        run: python -m unittest discover -v
