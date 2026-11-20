@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 
 from flow_lifecycle import parse_lifecycle
 from flow_opensearch import validate_index_prefix
-from flow_writer import make_opener, read_secret, send_bulk_updates, send_dns_update
+from flow_writer import make_opener, read_secret, send_bulk_updates, send_dns_update, send_bulk_dns_updates
 from dns_resolver import DNSResolver
 
 LOG = logging.getLogger("flow-collector")
@@ -129,7 +129,8 @@ def worker(stop, args):
     try:
         while not stop.is_set():
             if resolver is not None and pending_ptr:
-                for key, (doc, deadline) in list(pending_ptr.items())[:20]:
+                updates = []
+                for key, (doc, deadline) in list(pending_ptr.items())[:100]:
                     if time.monotonic() >= deadline:
                         pending_ptr.pop(key, None)
                         continue
@@ -140,33 +141,33 @@ def worker(stop, args):
                         ip = doc[field]["ip"]
                         with resolver.lock:
                             cached = resolver.cache.get(ip)
-                            if cached is not None and cached[1] > time.monotonic():
-                                hostname, until = cached
-                            else:
-                                hostname = None
-                                until = 0
-                        if hostname:
-                            names[field] = hostname
+                            hostname, until = cached if cached is not None and cached[1] > time.monotonic() else (None, 0)
+                        if cached is not None and until:
                             db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
                                        (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                        if hostname:
+                            names[field] = hostname
                     if names:
-                        try:
-                            send_dns_update(args.url, doc, names, username, password,
-                                            args.timeout, opener, api_key, index_prefix=args.index_prefix)
-                            for field in names:
-                                doc[field]["reverse_dns"] = names[field]
-                            if all(doc[field].get("reverse_dns") or
-                                   (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic() and
-                                    resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
-                                   for field in ("source", "destination")):
+                        updates.append((key, doc, names))
+                if updates:
+                    try:
+                        results = send_bulk_dns_updates(args.url, [(doc, names) for _, doc, names in updates],
+                                                        username, password, args.timeout, opener, api_key,
+                                                        index_prefix=args.index_prefix)
+                        for (key, doc, names), success in zip(updates, results):
+                            if not success:
+                                continue
+                            for field, hostname in names.items():
+                                doc[field]["reverse_dns"] = hostname
+                            with resolver.lock:
+                                complete = all(doc[field].get("reverse_dns") or
+                                               (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic()
+                                                and resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
+                                               for field in ("source", "destination"))
+                            if complete:
                                 pending_ptr.pop(key, None)
-                        except HTTPError as exc:
-                            if exc.code == 404:
-                                pending_ptr.pop(key, None)
-                            else:
-                                LOG.warning("PTR followup HTTP %d", exc.code)
-                        except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as exc:
-                            LOG.warning("PTR followup failed (%s)", type(exc).__name__)
+                    except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as exc:
+                        LOG.warning("PTR bulk followup failed (%s)", type(exc).__name__)
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
             if not rows:
                 stop.wait(0.5)
