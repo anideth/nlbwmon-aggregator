@@ -120,8 +120,15 @@ def worker(stop, args):
                 continue
             try:
                 docs = [json.loads(payload) for _, payload in rows]
-                successes = send_bulk_updates(args.url, docs, username, password,
-                                              args.timeout, opener, api_key, index_prefix=args.index_prefix)
+                expired = [is_expired(doc, args.max_flow_age) for doc in docs]
+                fresh = [doc for doc, old in zip(docs, expired) if not old]
+                sent = (send_bulk_updates(args.url, fresh, username, password,
+                                          args.timeout, opener, api_key, index_prefix=args.index_prefix)
+                        if fresh else [])
+                sent_iter = iter(sent)
+                successes = [True if old else next(sent_iter, False) for old in expired]
+                if any(expired):
+                    LOG.warning("flow events discarded by max-flow-age: %d", sum(expired))
                 # A failed item blocks all later items, even if OpenSearch accepted
                 # them. Replaying later items is safe: the update script is monotonic
                 # (closed never reopens) and repeated NEW/DESTROY is a noop.
