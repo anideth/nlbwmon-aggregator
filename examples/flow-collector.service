@@ -11,7 +11,7 @@ SupplementaryGroups=flow-secrets
 WorkingDirectory=/opt/nlbwmon-aggregator
 Environment=PYTHONUNBUFFERED=1
 Environment=OPENSEARCH_USER=writer
-ExecStart=/usr/bin/python3 /opt/nlbwmon-aggregator/flow_collector.py --listen 192.0.2.10 --port 5517 --db /opt/nlbwmon-data/flows.db --url https://search.example:9200 --ca-file /etc/ssl/certs/ca-certificates.crt --password-file /etc/flow-writer/password --dns
+ExecStart=/usr/bin/python3 /opt/nlbwmon-aggregator/flow_collector.py --listen 192.0.2.10 --port 5517 --db /opt/nlbwmon-data/flows.db --url https://search.example:9200 --ca-file /etc/ssl/certs/ca-certificates.crt --password-file /etc/flow-writer/password --dns --max-flow-age 2505600
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
