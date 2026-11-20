@@ -103,13 +103,32 @@ class CollectorTests(unittest.TestCase):
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
 
-    def test_dns_job_is_persisted_only_after_successful_delivery(self):
-        self.insert()
-        self.run_worker(OSError("offline"), wait=0.07)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
-        self.run_worker(lambda *args, **kwargs: [True], wait=0.08, dns=True)
+    def test_ptr_cache_enriches_bulk_without_creating_connection_jobs(self):
+        self.insert("first")
+        self.insert("second")
+        self.db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?)",
+                        ("198.51.100.20", "remote.example.test", time.time() + 3600))
+        seen = []
+        def sender(url, docs, *args, **kwargs):
+            seen.extend(docs)
+            return [True] * len(docs)
+        with patch("flow_collector.DNSResolver") as resolver:
+            resolver.return_value.cache = {}
+            resolver.return_value.lock = threading.Lock()
+            self.run_worker(sender, dns=True)
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(d["destination"]["reverse_dns"] == "remote.example.test" for d in seen))
         self.assertEqual(self.count(), 0)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
+
+    def test_failed_delivery_does_not_create_ptr_jobs(self):
+        self.insert()
+        with patch("flow_collector.DNSResolver") as resolver:
+            resolver.return_value.cache = {}
+            resolver.return_value.lock = threading.Lock()
+            self.run_worker(OSError("offline"), wait=0.07, dns=True)
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
 
     def test_failed_delivery_survives_worker_restart(self):
         self.insert()
