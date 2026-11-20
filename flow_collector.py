@@ -146,8 +146,11 @@ def worker(stop, args):
                     db.execute("BEGIN IMMEDIATE")
                     for (ident, payload), doc, old in zip(rows[:prefix], docs[:prefix], expired[:prefix]):
                         if not old and getattr(args, "dns", False):
-                            db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO UPDATE SET payload=excluded.payload",
-                                       (doc["router_name"], doc["connection_id"], payload))
+                            # PTR enrichment is best effort. Never let its backlog
+                            # grow without bound or block lifecycle delivery.
+                            if db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0] < args.max_dns_jobs:
+                                db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO UPDATE SET payload=excluded.payload",
+                                           (doc["router_name"], doc["connection_id"], payload))
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
                     db.execute("COMMIT")
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
@@ -229,6 +232,7 @@ def main():
     ap.add_argument("--port", type=int, default=5517)
     ap.add_argument("--db", required=True)
     ap.add_argument("--max-events", type=int, default=100000)
+    ap.add_argument("--max-dns-jobs", type=int, default=100000, help="best-effort PTR queue limit; existing rows are preserved")
     ap.add_argument("--bulk-size", type=int, default=100)
     ap.add_argument("--max-flow-age", type=int, default=2592000, help="maximum age in seconds since flow start; must be below index retention (default: 30 days)")
     ap.add_argument("--index-prefix", default="conntrack-flows", help="OpenSearch index namespace (default: conntrack-flows)")
@@ -250,7 +254,7 @@ def main():
     u = urlsplit(args.url)
     if u.scheme not in ("http", "https") or not u.netloc or u.username is not None or u.password is not None or u.path not in ("", "/") or u.query or u.fragment:
         ap.error("invalid OpenSearch URL")
-    if args.max_flow_age <= 0 or args.max_events <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
+    if args.max_flow_age <= 0 or args.max_events <= 0 or args.max_dns_jobs <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
         ap.error("invalid queue or retry parameters")
     try:
         validate_index_prefix(args.index_prefix)
