@@ -58,7 +58,7 @@ def connect_db(path):
     # New databases get the scheduling index immediately. On large existing
     # databases build it during a planned maintenance window instead of
     # blocking collector startup with a multi-million-row index build.
-    if db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0] < 100000:
+    if os.path.getsize(path) < 64 * 1024 * 1024:
         db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
     return db
 
