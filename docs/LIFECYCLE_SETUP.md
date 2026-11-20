@@ -353,3 +353,13 @@ GET _plugins/_ism/explain/conntrack-flows-tests-*
 ```
 
 For a disposable lab index only, stop the collector **before** deleting/recreating a daily index; otherwise queued writes can immediately recreate it with the old template. Existing mappings are immutable; never delete production data merely to apply a template. Test the new mapping with a fresh NEW/DESTROY flow.
+
+## Beta.2 outage/restart recovery validation (2026-11-20)
+
+**Controlled isolated test, production unchanged.** On the dedicated test collector, the OpenSearch URL was temporarily changed to an unreachable local HTTPS endpoint, while the router-facing listener remained bound to the lab interface. The service stayed `active` and continued receiving events. Its SQLite `events` queue grew from **0 to 3** rows; the journal repeatedly reported `bulk delivery failure (URLError); batch retained` at roughly five-second intervals.
+
+With OpenSearch still unavailable, the collector was restarted using systemd. It returned to `active`; the queue then contained **4** rows. This is consistent with persistence across restart plus an additional incoming event, but individual SQLite row IDs were not recorded before/after restart, so strict per-row identity was not independently checked.
+
+The original OpenSearch URL was restored and the collector restarted. The operator observed that the SQLite queue drained completely and that events arrived in the isolated test index. A recovered TCP flow was observed as a `DESTROY`/`closed` document with final counters, `flow.new_sequence=41`, `flow.destroy_sequence=42`, nanosecond start/end timestamps and `flow.duration_ns=48280895800` (48.280895800 seconds). Its `_version=3` is not a duplicate counter; PTR enrichment may increment document versions.
+
+**Conclusion:** the lab demonstrates retry after OpenSearch connection failure, durable queue behavior across a collector restart, and successful eventual delivery of observed events. **Not yet demonstrated:** strict identity of all pre-restart queue rows, exhaustive duplicate suppression during retry/partial Bulk acknowledgement, lost router-side events, multi-hour outage under load, or exact-once end-to-end semantics. Do not publish actual router/client IP addresses, hostnames or connection identifiers in public evidence.
