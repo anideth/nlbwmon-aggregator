@@ -153,7 +153,13 @@ def worker(stop, args):
                         try:
                             send_dns_update(args.url, doc, names, username, password,
                                             args.timeout, opener, api_key, index_prefix=args.index_prefix)
-                            pending_ptr.pop(key, None)
+                            for field in names:
+                                doc[field]["reverse_dns"] = names[field]
+                            if all(doc[field].get("reverse_dns") or
+                                   (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic() and
+                                    resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
+                                   for field in ("source", "destination")):
+                                pending_ptr.pop(key, None)
                         except HTTPError as exc:
                             if exc.code == 404:
                                 pending_ptr.pop(key, None)
