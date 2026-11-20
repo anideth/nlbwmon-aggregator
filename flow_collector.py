@@ -118,8 +118,12 @@ def worker(stop, args):
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
     username = os.environ.get("OPENSEARCH_USER")
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
-    dns_jobs_estimate = 0
-    dns_jobs_checked_at = 0.0
+    # Resolve PTR by unique IP before bulk delivery, never by connection.
+    # DNS work is asynchronous and cannot delay or block lifecycle delivery.
+    resolver = (DNSResolver(servers=getattr(args, "dns_server", None),
+                            dns_timeout=getattr(args, "dns_timeout", 1.5))
+                if getattr(args, "dns", False) else None)
+    last_prune = 0.0
     try:
         while not stop.is_set():
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
@@ -130,6 +134,34 @@ def worker(stop, args):
                 docs = [json.loads(payload) for _, payload in rows]
                 expired = [is_expired(doc, args.max_flow_age) for doc in docs]
                 fresh = [doc for doc, old in zip(docs, expired) if not old]
+                if resolver is not None and fresh:
+                    now = time.time()
+                    # One query per distinct IP per cache lifetime, not per flow.
+                    ips = {doc[field]["ip"] for doc in fresh for field in ("source", "destination")}
+                    known = {}
+                    for ip in ips:
+                        row = db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?", (ip, now)).fetchone()
+                        if row is not None:
+                            known[ip] = row[0]
+                            continue
+                        resolver.lookup(ip)
+                        with resolver.lock:
+                            cached = resolver.cache.get(ip)
+                            if cached is not None and cached[1] > time.monotonic():
+                                hostname, until = cached
+                                known[ip] = hostname
+                                db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                           (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    # Enrich a copy; never mutate the durable event payload.
+                    fresh = [dict(doc, source=dict(doc["source"]), destination=dict(doc["destination"])) for doc in fresh]
+                    for doc in fresh:
+                        for field in ("source", "destination"):
+                            hostname = known.get(doc[field]["ip"])
+                            if hostname:
+                                doc[field]["reverse_dns"] = hostname
+                    if time.monotonic() - last_prune > 3600:
+                        db.execute("DELETE FROM dns_cache WHERE expires_at<=?", (time.time(),))
+                        last_prune = time.monotonic()
                 sent = (send_bulk_updates(args.url, fresh, username, password,
                                           args.timeout, opener, api_key, index_prefix=args.index_prefix)
                         if fresh else [])
@@ -148,23 +180,6 @@ def worker(stop, args):
                 if prefix:
                     db.execute("BEGIN IMMEDIATE")
                     for (ident, payload), doc, old in zip(rows[:prefix], docs[:prefix], expired[:prefix]):
-                        if not old and getattr(args, "dns", False):
-                            # PTR enrichment is best effort. Never let its backlog
-                            # grow without bound or block lifecycle delivery.
-                            if time.monotonic() - dns_jobs_checked_at >= 60:
-                                dns_jobs_estimate = db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0]
-                                dns_jobs_checked_at = time.monotonic()
-                            # Negative PTR results are useful: avoid creating a
-                            # per-connection job when neither endpoint can have
-                            # an enrichment. Expired entries count as cache misses.
-                            ips = (doc["source"]["ip"], doc["destination"]["ip"])
-                            cached = [db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?",
-                                                 (ip, time.time())).fetchone() for ip in ips]
-                            both_negative = all(entry is not None and entry[0] is None for entry in cached)
-                            if not both_negative and dns_jobs_estimate < getattr(args, "max_dns_jobs", 100000):
-                                cursor = db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO NOTHING",
-                                                    (doc["router_name"], doc["connection_id"], payload))
-                                dns_jobs_estimate += cursor.rowcount
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
                     db.execute("COMMIT")
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
@@ -331,16 +346,10 @@ def main():
         signal.signal(signal.SIGINT, shutdown)
         thread = threading.Thread(target=worker, args=(stop, args), daemon=True)
         thread.start()
-        dns_thread = None
-        if args.dns:
-            dns_thread = threading.Thread(target=dns_worker, args=(stop, args), daemon=True)
-            dns_thread.start()
         LOG.info("lifecycle collector listening on %s:%d", args.listen, args.port)
         server.serve_forever(poll_interval=0.5)
         stop.set()
         thread.join(timeout=args.timeout + 2)
-        if dns_thread is not None:
-            dns_thread.join(timeout=args.timeout + 2)
 
 
 if __name__ == "__main__":
