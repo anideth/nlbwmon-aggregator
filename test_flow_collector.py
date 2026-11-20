@@ -89,7 +89,7 @@ class CollectorTests(unittest.TestCase):
                                ca_file=None, client_cert=None, client_key=None,
                                insecure=False, password_file=None, api_key_file=None,
                                timeout=0.1, retry_delay=0.02, dns=dns,
-                               bulk_size=100, index_prefix="conntrack-flows-test", max_flow_age=2592000)
+                               bulk_size=100, max_dns_jobs=100000, index_prefix="conntrack-flows-test", max_flow_age=2592000)
         stop = threading.Event()
         with patch("flow_collector.make_opener", return_value=object()), patch(
                 "flow_collector.send_bulk_updates", side_effect=sender):
