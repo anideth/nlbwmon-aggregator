@@ -124,8 +124,43 @@ def worker(stop, args):
                             dns_timeout=getattr(args, "dns_timeout", 1.5))
                 if getattr(args, "dns", False) else None)
     last_prune = 0.0
+    pending_ptr = {}  # bounded best-effort late PTR followups
+    max_pending_ptr = 2000
     try:
         while not stop.is_set():
+            if resolver is not None and pending_ptr:
+                for key, (doc, deadline) in list(pending_ptr.items())[:20]:
+                    if time.monotonic() >= deadline:
+                        pending_ptr.pop(key, None)
+                        continue
+                    names = {}
+                    for field in ("source", "destination"):
+                        if doc[field].get("reverse_dns"):
+                            continue
+                        ip = doc[field]["ip"]
+                        with resolver.lock:
+                            cached = resolver.cache.get(ip)
+                            if cached is not None and cached[1] > time.monotonic():
+                                hostname, until = cached
+                            else:
+                                hostname = None
+                                until = 0
+                        if hostname:
+                            names[field] = hostname
+                            db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                       (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    if names:
+                        try:
+                            send_dns_update(args.url, doc, names, username, password,
+                                            args.timeout, opener, api_key, index_prefix=args.index_prefix)
+                            pending_ptr.pop(key, None)
+                        except HTTPError as exc:
+                            if exc.code == 404:
+                                pending_ptr.pop(key, None)
+                            else:
+                                LOG.warning("PTR followup HTTP %d", exc.code)
+                        except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as exc:
+                            LOG.warning("PTR followup failed (%s)", type(exc).__name__)
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
             if not rows:
                 stop.wait(0.5)
@@ -196,6 +231,14 @@ def worker(stop, args):
                     for (ident, payload), doc, old in zip(rows[:prefix], docs[:prefix], expired[:prefix]):
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
                     db.execute("COMMIT")
+                    if resolver is not None:
+                        for doc, old in zip(docs[:prefix], expired[:prefix]):
+                            if old:
+                                continue
+                            if any(doc[field]["ip"] not in known for field in ("source", "destination")):
+                                key = (doc["router_name"], doc["connection_id"])
+                                if key in pending_ptr or len(pending_ptr) < max_pending_ptr:
+                                    pending_ptr[key] = (doc, time.monotonic() + 30.0)
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
                 if prefix != len(rows):
                     LOG.warning("bulk partial failure at id=%d; retaining ordered suffix", rows[prefix][0])
