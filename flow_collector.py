@@ -179,6 +179,11 @@ def dns_worker(stop, args):
                 continue
             router, connection, payload = row
             doc = json.loads(payload)
+            if is_expired(doc, args.max_flow_age):
+                db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?",
+                           (router, connection, payload))
+                LOG.warning("expired PTR job discarded")
+                continue
             names = {}
             ready = True
             for field in ("source", "destination"):
