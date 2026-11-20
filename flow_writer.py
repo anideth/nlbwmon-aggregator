@@ -96,6 +96,53 @@ def send_bulk_updates(base_url, docs, username=None, password=None, timeout=10, 
     return successes
 
 
+
+def send_bulk_dns_updates(base_url, updates, username=None, password=None, timeout=10,
+                          opener=None, api_key=None, index_prefix="conntrack-flows"):
+    """Bulk patch existing documents; return per-item success flags (404 is failure)."""
+    if not updates:
+        return []
+    lines = []
+    for doc, names in updates:
+        if not names or any(field not in ("source", "destination") for field in names):
+            raise ValueError("invalid DNS enrichment")
+        index, identifier = document_address(doc, index_prefix)
+        script = """
+if (ctx._source.router_name != params.router ||
+    ctx._source.connection_id != params.connection) {
+  throw new IllegalArgumentException('flow identity collision');
+}
+if (params.names.containsKey('source') && ctx._source.source != null) {
+  ctx._source.source.reverse_dns = params.names.source;
+}
+if (params.names.containsKey('destination') && ctx._source.destination != null) {
+  ctx._source.destination.reverse_dns = params.names.destination;
+}
+"""
+        body = {"script": {"lang": "painless", "source": script,
+                           "params": {"router": doc["router_name"],
+                                      "connection": doc["connection_id"], "names": names}}}
+        lines.append(json.dumps({"update": {"_index": index, "_id": identifier}}, separators=(",", ":")))
+        lines.append(json.dumps(body, separators=(",", ":")))
+    headers = {"Content-Type": "application/x-ndjson"}
+    if username is not None:
+        token = base64.b64encode((username + ":" + (password or "")).encode()).decode("ascii")
+        headers["Authorization"] = "Basic " + token
+    if api_key is not None:
+        headers["Authorization"] = "ApiKey " + api_key
+    request = Request(base_url.rstrip("/") + "/_bulk",
+                      data=("\n".join(lines) + "\n").encode("utf-8"), headers=headers, method="POST")
+    with opener.open(request, timeout=timeout) as response:
+        result = json.load(response)
+    items = result.get("items")
+    if not isinstance(items, list) or len(items) != len(updates):
+        raise ValueError("invalid PTR bulk response")
+    return [isinstance(item, dict) and isinstance(item.get("update"), dict)
+            and item["update"].get("status") in (200, 201)
+            and item["update"].get("result") in ("updated", "noop")
+            for item in items]
+
+
 def send_dns_update(base_url, doc, names, username=None, password=None, timeout=10, opener=None, api_key=None, index_prefix="conntrack-flows"):
     """Patch only reverse_dns fields of an existing lifecycle document."""
     if not names or any(field not in ("source", "destination") for field in names):
