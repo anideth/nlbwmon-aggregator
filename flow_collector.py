@@ -56,6 +56,8 @@ def connect_db(path):
     columns = {row[1] for row in db.execute("PRAGMA table_info(dns_jobs)")}
     if "next_attempt" not in columns:
         db.execute("ALTER TABLE dns_jobs ADD COLUMN next_attempt REAL NOT NULL DEFAULT 0")
+    if "attempts" not in columns:
+        db.execute("ALTER TABLE dns_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
     # Existing large queues must be drained or cleared before upgrading.
     # The due index prevents a full sort on every PTR job.
     db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
@@ -193,11 +195,11 @@ def dns_worker(stop, args):
                 cache_pruned_at = time.monotonic()
             # A bounded queue still needs a due index: sorting the whole table
             # on each lookup is unacceptable under sustained load.
-            row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
+            row = db.execute("SELECT router_name,connection_id,payload,attempts FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
             if row is None:
                 stop.wait(0.5)
                 continue
-            router, connection, payload = row
+            router, connection, payload, attempts = row
             doc = json.loads(payload)
             if is_expired(doc, args.max_flow_age):
                 db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?",
@@ -229,6 +231,9 @@ def dns_worker(stop, args):
             if not ready:
                 db.execute("UPDATE dns_jobs SET next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + 0.5, router, connection, payload))
                 continue
+            if attempts >= 3:
+                db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?", (router, connection, payload))
+                continue
             try:
                 if names:
                     send_dns_update(args.url, doc, names, username, password,
@@ -241,9 +246,10 @@ def dns_worker(stop, args):
                                (router, connection, payload))
                 else:
                     LOG.warning("PTR update HTTP %d; retrying", exc.code)
-                    db.execute("UPDATE dns_jobs SET next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
+                    db.execute("UPDATE dns_jobs SET attempts=attempts+1,next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
             except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
                 LOG.warning("PTR update failed (%s); retrying", type(exc).__name__)
+                db.execute("UPDATE dns_jobs SET attempts=attempts+1,next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
                 stop.wait(args.retry_delay)
     finally:
         db.close()
