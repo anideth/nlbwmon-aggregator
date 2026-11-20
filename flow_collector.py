@@ -152,6 +152,20 @@ def worker(stop, args):
                                 known[ip] = hostname
                                 db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
                                            (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    # Give first-seen IPs a short, bounded chance to resolve.
+                    # Never hold a SQLite transaction or wait for full DNS timeout.
+                    unresolved = {ip for ip in ips if ip not in known}
+                    deadline = time.monotonic() + 0.25 if unresolved else time.monotonic()
+                    while unresolved and time.monotonic() < deadline and not stop.is_set():
+                        stop.wait(min(0.025, max(0.0, deadline - time.monotonic())))
+                        with resolver.lock:
+                            completed = {ip: resolver.cache[ip] for ip in unresolved
+                                         if ip in resolver.cache and resolver.cache[ip][1] > time.monotonic()}
+                        for ip, (hostname, until) in completed.items():
+                            known[ip] = hostname
+                            unresolved.remove(ip)
+                            db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                       (ip, hostname, time.time() + max(0.0, until - time.monotonic())))
                     # Enrich a copy; never mutate the durable event payload.
                     fresh = [dict(doc, source=dict(doc["source"]), destination=dict(doc["destination"])) for doc in fresh]
                     for doc in fresh:
