@@ -112,7 +112,7 @@ PUT _index_template/conntrack-flows-template
 }
 ```
 
-`dynamic: false` is an optional strict-schema preference for new deployments; unknown fields remain in `_source` but are not indexed. If the existing template uses dynamic mappings, do not silently change that behavior. Replicas `0` is appropriate for a single-node lab, **not** a general production recommendation. The collector needs index creation privileges if daily indices do not already exist and auto-creation is enabled.
+**Beta.2 timestamp mapping:** for NEW indices, use `date_nanos` for `flow.started_at` and `flow.ended_at`, and `long` for `flow.duration_ns`. The exporter sends optional `started_nsec` and `finished_nsec` alongside legacy whole-second fields. An existing index field mapped as `date` **cannot be changed in place** to `date_nanos`; prepare a new template/index generation before deploying the beta.2 timestamp pipeline. Do not blindly replace the live beta.1 template.\n\n`dynamic: false` is an optional strict-schema preference for new deployments; unknown fields remain in `_source` but are not indexed. If the existing template uses dynamic mappings, do not silently change that behavior. Replicas `0` is appropriate for a single-node lab, **not** a general production recommendation. The collector needs index creation privileges if daily indices do not already exist and auto-creation is enabled.
 
 Inspect, simulate, and verify:
 ```http
