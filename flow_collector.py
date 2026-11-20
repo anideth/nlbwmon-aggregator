@@ -117,6 +117,8 @@ def worker(stop, args):
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
     username = os.environ.get("OPENSEARCH_USER")
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
+    dns_jobs_estimate = 0
+    dns_jobs_checked_at = 0.0
     try:
         while not stop.is_set():
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
@@ -148,9 +150,13 @@ def worker(stop, args):
                         if not old and getattr(args, "dns", False):
                             # PTR enrichment is best effort. Never let its backlog
                             # grow without bound or block lifecycle delivery.
-                            if db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0] < args.max_dns_jobs:
-                                db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO UPDATE SET payload=excluded.payload",
-                                           (doc["router_name"], doc["connection_id"], payload))
+                            if time.monotonic() - dns_jobs_checked_at >= 60:
+                                dns_jobs_estimate = db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0]
+                                dns_jobs_checked_at = time.monotonic()
+                            if dns_jobs_estimate < args.max_dns_jobs:
+                                cursor = db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO NOTHING",
+                                                    (doc["router_name"], doc["connection_id"], payload))
+                                dns_jobs_estimate += cursor.rowcount
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
                     db.execute("COMMIT")
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
