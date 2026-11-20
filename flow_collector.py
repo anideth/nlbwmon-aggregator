@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 
 from flow_lifecycle import parse_lifecycle
 from flow_opensearch import validate_index_prefix
-from flow_writer import make_opener, read_secret, send_bulk_updates, send_dns_update
+from flow_writer import make_opener, read_secret, send_bulk_updates, send_dns_update, send_bulk_dns_updates
 from dns_resolver import DNSResolver
 
 LOG = logging.getLogger("flow-collector")
@@ -52,9 +52,15 @@ def connect_db(path):
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS events_identity ON events(router_name, connection_id, event_type)")
     db.execute("CREATE TABLE IF NOT EXISTS dns_jobs (router_name TEXT NOT NULL, connection_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(router_name,connection_id))")
+    db.execute("CREATE TABLE IF NOT EXISTS dns_cache (ip TEXT PRIMARY KEY, hostname TEXT, expires_at REAL NOT NULL)")
     columns = {row[1] for row in db.execute("PRAGMA table_info(dns_jobs)")}
     if "next_attempt" not in columns:
         db.execute("ALTER TABLE dns_jobs ADD COLUMN next_attempt REAL NOT NULL DEFAULT 0")
+    if "attempts" not in columns:
+        db.execute("ALTER TABLE dns_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    # Existing large queues must be drained or cleared before upgrading.
+    # The due index prevents a full sort on every PTR job.
+    db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
     return db
 
 
@@ -105,6 +111,62 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def ptr_followup_worker(stop, args, resolver, pending_ptr, pending_lock, username, password, api_key):
+    """Independent, bounded best-effort PTR updates; never blocks lifecycle bulk."""
+    db = connect_db(args.db)
+    opener = make_opener(args.url, args.ca_file, args.client_cert, args.client_key, args.insecure)
+    try:
+        while not stop.is_set():
+            with pending_lock:
+                snapshot = list(pending_ptr.items())[:100]
+            updates = []
+            for key, (doc, deadline) in snapshot:
+                if time.monotonic() >= deadline:
+                    with pending_lock:
+                        if pending_ptr.get(key, (None, None))[0] is doc:
+                            pending_ptr.pop(key, None)
+                    continue
+                names = {}
+                for field in ("source", "destination"):
+                    if doc[field].get("reverse_dns"):
+                        continue
+                    ip = doc[field]["ip"]
+                    with resolver.lock:
+                        cached = resolver.cache.get(ip)
+                        hostname, until = cached if cached is not None and cached[1] > time.monotonic() else (None, 0)
+                    if cached is not None and until:
+                        db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                   (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    if hostname:
+                        names[field] = hostname
+                if names:
+                    updates.append((key, doc, names))
+            if updates:
+                try:
+                    results = send_bulk_dns_updates(args.url, [(doc, names) for _, doc, names in updates],
+                                                    username, password, args.timeout, opener, api_key,
+                                                    index_prefix=args.index_prefix)
+                    for (key, doc, names), success in zip(updates, results):
+                        if not success:
+                            continue
+                        for field, hostname in names.items():
+                            doc[field]["reverse_dns"] = hostname
+                        with resolver.lock:
+                            complete = all(doc[field].get("reverse_dns") or
+                                           (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic()
+                                            and resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
+                                           for field in ("source", "destination"))
+                        if complete:
+                            with pending_lock:
+                                if pending_ptr.get(key, (None, None))[0] is doc:
+                                    pending_ptr.pop(key, None)
+                except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+                    LOG.warning("PTR bulk followup failed (%s)", type(exc).__name__)
+            stop.wait(0.1 if snapshot else 0.5)
+    finally:
+        db.close()
+
+
 def worker(stop, args):
     """Ordered bulk delivery with durable, replay-safe SQLite outbox."""
     db = connect_db(args.db)
@@ -112,6 +174,21 @@ def worker(stop, args):
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
     username = os.environ.get("OPENSEARCH_USER")
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
+    # Resolve PTR by unique IP before bulk delivery, never by connection.
+    # DNS work is asynchronous and cannot delay or block lifecycle delivery.
+    resolver = (DNSResolver(servers=getattr(args, "dns_server", None),
+                            dns_timeout=getattr(args, "dns_timeout", 1.5))
+                if getattr(args, "dns", False) else None)
+    last_prune = 0.0
+    pending_ptr = {}  # bounded best-effort late PTR followups
+    max_pending_ptr = 2000
+    pending_lock = threading.Lock()
+    ptr_thread = None
+    if resolver is not None:
+        ptr_thread = threading.Thread(target=ptr_followup_worker,
+                                      args=(stop, args, resolver, pending_ptr, pending_lock,
+                                            username, password, api_key), daemon=True)
+        ptr_thread.start()
     try:
         while not stop.is_set():
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
@@ -122,6 +199,48 @@ def worker(stop, args):
                 docs = [json.loads(payload) for _, payload in rows]
                 expired = [is_expired(doc, args.max_flow_age) for doc in docs]
                 fresh = [doc for doc, old in zip(docs, expired) if not old]
+                if resolver is not None and fresh:
+                    now = time.time()
+                    # One query per distinct IP per cache lifetime, not per flow.
+                    ips = {doc[field]["ip"] for doc in fresh for field in ("source", "destination")}
+                    known = {}
+                    for ip in ips:
+                        row = db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?", (ip, now)).fetchone()
+                        if row is not None:
+                            known[ip] = row[0]
+                            continue
+                        resolver.lookup(ip)
+                        with resolver.lock:
+                            cached = resolver.cache.get(ip)
+                            if cached is not None and cached[1] > time.monotonic():
+                                hostname, until = cached
+                                known[ip] = hostname
+                                db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                           (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    # Give first-seen IPs a short, bounded chance to resolve.
+                    # Never hold a SQLite transaction or wait for full DNS timeout.
+                    unresolved = {ip for ip in ips if ip not in known}
+                    deadline = time.monotonic() + 0.25 if unresolved else time.monotonic()
+                    while unresolved and time.monotonic() < deadline and not stop.is_set():
+                        stop.wait(min(0.025, max(0.0, deadline - time.monotonic())))
+                        with resolver.lock:
+                            completed = {ip: resolver.cache[ip] for ip in unresolved
+                                         if ip in resolver.cache and resolver.cache[ip][1] > time.monotonic()}
+                        for ip, (hostname, until) in completed.items():
+                            known[ip] = hostname
+                            unresolved.remove(ip)
+                            db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                       (ip, hostname, time.time() + max(0.0, until - time.monotonic())))
+                    # Enrich a copy; never mutate the durable event payload.
+                    fresh = [dict(doc, source=dict(doc["source"]), destination=dict(doc["destination"])) for doc in fresh]
+                    for doc in fresh:
+                        for field in ("source", "destination"):
+                            hostname = known.get(doc[field]["ip"])
+                            if hostname:
+                                doc[field]["reverse_dns"] = hostname
+                    if time.monotonic() - last_prune > 3600:
+                        db.execute("DELETE FROM dns_cache WHERE expires_at<=?", (time.time(),))
+                        last_prune = time.monotonic()
                 sent = (send_bulk_updates(args.url, fresh, username, password,
                                           args.timeout, opener, api_key, index_prefix=args.index_prefix)
                         if fresh else [])
@@ -140,11 +259,17 @@ def worker(stop, args):
                 if prefix:
                     db.execute("BEGIN IMMEDIATE")
                     for (ident, payload), doc, old in zip(rows[:prefix], docs[:prefix], expired[:prefix]):
-                        if not old and getattr(args, "dns", False):
-                            db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO UPDATE SET payload=excluded.payload",
-                                       (doc["router_name"], doc["connection_id"], payload))
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
                     db.execute("COMMIT")
+                    if resolver is not None:
+                        for doc, old in zip(docs[:prefix], expired[:prefix]):
+                            if old:
+                                continue
+                            if any(doc[field]["ip"] not in known for field in ("source", "destination")):
+                                key = (doc["router_name"], doc["connection_id"])
+                                with pending_lock:
+                                    if key in pending_ptr or len(pending_ptr) < max_pending_ptr:
+                                        pending_ptr[key] = (doc, time.monotonic() + 30.0)
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
                 if prefix != len(rows):
                     LOG.warning("bulk partial failure at id=%d; retaining ordered suffix", rows[prefix][0])
@@ -160,6 +285,8 @@ def worker(stop, args):
                 LOG.error("bulk delivery failure (%s); batch retained", type(exc).__name__)
                 stop.wait(args.retry_delay)
     finally:
+        if ptr_thread is not None:
+            ptr_thread.join(timeout=args.timeout + 1)
         db.close()
 
 
@@ -167,17 +294,24 @@ def dns_worker(stop, args):
     """Background PTR updates; DNS never blocks the event-delivery worker."""
     db = connect_db(args.db)
     resolver = DNSResolver(servers=getattr(args, 'dns_server', None), dns_timeout=getattr(args, 'dns_timeout', 1.5))
+    cache_pruned_at = 0.0
+    # Keep the PTR scheduler independent from lifecycle delivery.
     opener = make_opener(args.url, args.ca_file, args.client_cert, args.client_key, args.insecure)
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
     username = os.environ.get("OPENSEARCH_USER")
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
     try:
         while not stop.is_set():
-            row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
+            if time.monotonic() - cache_pruned_at >= 3600:
+                db.execute("DELETE FROM dns_cache WHERE expires_at <= ?", (time.time(),))
+                cache_pruned_at = time.monotonic()
+            # A bounded queue still needs a due index: sorting the whole table
+            # on each lookup is unacceptable under sustained load.
+            row = db.execute("SELECT router_name,connection_id,payload,attempts FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
             if row is None:
                 stop.wait(0.5)
                 continue
-            router, connection, payload = row
+            router, connection, payload, attempts = row
             doc = json.loads(payload)
             if is_expired(doc, args.max_flow_age):
                 db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?",
@@ -188,15 +322,29 @@ def dns_worker(stop, args):
             ready = True
             for field in ("source", "destination"):
                 ip = doc[field]["ip"]
+                now = time.time()
+                cached_db = db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?", (ip, now)).fetchone()
+                if cached_db is not None:
+                    if cached_db[0]:
+                        names[field] = cached_db[0]
+                    continue
                 resolver.lookup(ip)
                 with resolver.lock:
                     cached = resolver.cache.get(ip)
                     if cached is None or cached[1] <= time.monotonic():
                         ready = False
-                    elif cached[0]:
-                        names[field] = cached[0]
+                    else:
+                        hostname, deadline = cached
+                        remaining = max(0.0, deadline - time.monotonic())
+                        db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                   (ip, hostname, time.time() + remaining))
+                        if hostname:
+                            names[field] = hostname
             if not ready:
                 db.execute("UPDATE dns_jobs SET next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + 0.5, router, connection, payload))
+                continue
+            if attempts >= 3:
+                db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?", (router, connection, payload))
                 continue
             try:
                 if names:
@@ -210,9 +358,10 @@ def dns_worker(stop, args):
                                (router, connection, payload))
                 else:
                     LOG.warning("PTR update HTTP %d; retrying", exc.code)
-                    db.execute("UPDATE dns_jobs SET next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
+                    db.execute("UPDATE dns_jobs SET attempts=attempts+1,next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
             except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
                 LOG.warning("PTR update failed (%s); retrying", type(exc).__name__)
+                db.execute("UPDATE dns_jobs SET attempts=attempts+1,next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + args.retry_delay, router, connection, payload))
                 stop.wait(args.retry_delay)
     finally:
         db.close()
@@ -224,6 +373,7 @@ def main():
     ap.add_argument("--port", type=int, default=5517)
     ap.add_argument("--db", required=True)
     ap.add_argument("--max-events", type=int, default=100000)
+    ap.add_argument("--max-dns-jobs", type=int, default=100000, help="best-effort PTR queue limit; existing rows are preserved")
     ap.add_argument("--bulk-size", type=int, default=100)
     ap.add_argument("--max-flow-age", type=int, default=2592000, help="maximum age in seconds since flow start; must be below index retention (default: 30 days)")
     ap.add_argument("--index-prefix", default="conntrack-flows", help="OpenSearch index namespace (default: conntrack-flows)")
@@ -245,7 +395,7 @@ def main():
     u = urlsplit(args.url)
     if u.scheme not in ("http", "https") or not u.netloc or u.username is not None or u.password is not None or u.path not in ("", "/") or u.query or u.fragment:
         ap.error("invalid OpenSearch URL")
-    if args.max_flow_age <= 0 or args.max_events <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
+    if args.max_flow_age <= 0 or args.max_events <= 0 or args.max_dns_jobs <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
         ap.error("invalid queue or retry parameters")
     try:
         validate_index_prefix(args.index_prefix)
@@ -286,16 +436,10 @@ def main():
         signal.signal(signal.SIGINT, shutdown)
         thread = threading.Thread(target=worker, args=(stop, args), daemon=True)
         thread.start()
-        dns_thread = None
-        if args.dns:
-            dns_thread = threading.Thread(target=dns_worker, args=(stop, args), daemon=True)
-            dns_thread.start()
         LOG.info("lifecycle collector listening on %s:%d", args.listen, args.port)
         server.serve_forever(poll_interval=0.5)
         stop.set()
         thread.join(timeout=args.timeout + 2)
-        if dns_thread is not None:
-            dns_thread.join(timeout=args.timeout + 2)
 
 
 if __name__ == "__main__":

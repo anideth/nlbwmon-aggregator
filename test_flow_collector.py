@@ -89,7 +89,7 @@ class CollectorTests(unittest.TestCase):
                                ca_file=None, client_cert=None, client_key=None,
                                insecure=False, password_file=None, api_key_file=None,
                                timeout=0.1, retry_delay=0.02, dns=dns,
-                               bulk_size=100, index_prefix="conntrack-flows-test", max_flow_age=2592000)
+                               bulk_size=100, max_dns_jobs=100000, index_prefix="conntrack-flows-test", max_flow_age=2592000)
         stop = threading.Event()
         with patch("flow_collector.make_opener", return_value=object()), patch(
                 "flow_collector.send_bulk_updates", side_effect=sender):
@@ -103,13 +103,127 @@ class CollectorTests(unittest.TestCase):
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
 
-    def test_dns_job_is_persisted_only_after_successful_delivery(self):
-        self.insert()
-        self.run_worker(OSError("offline"), wait=0.07)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
-        self.run_worker(lambda *args, **kwargs: [True], wait=0.08, dns=True)
+    def test_ptr_cache_enriches_bulk_without_creating_connection_jobs(self):
+        self.insert("first")
+        self.insert("second")
+        self.db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?)",
+                        ("198.51.100.20", "remote.example.test", time.time() + 3600))
+        seen = []
+        def sender(url, docs, *args, **kwargs):
+            seen.extend(docs)
+            return [True] * len(docs)
+        with patch("flow_collector.DNSResolver") as resolver:
+            resolver.return_value.cache = {}
+            resolver.return_value.lock = threading.Lock()
+            self.run_worker(sender, dns=True)
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(d["destination"]["reverse_dns"] == "remote.example.test" for d in seen))
         self.assertEqual(self.count(), 0)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
+
+    def test_failed_delivery_does_not_create_ptr_jobs(self):
+        self.insert()
+        with patch("flow_collector.DNSResolver") as resolver:
+            resolver.return_value.cache = {}
+            resolver.return_value.lock = threading.Lock()
+            self.run_worker(OSError("offline"), wait=0.07, dns=True)
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
+
+    def test_late_ptr_bulk_after_delivery(self):
+        self.insert("late-ptr")
+        delivered = threading.Event()
+        followed = threading.Event()
+        instances = []
+        class FakeResolver:
+            def __init__(self, **kwargs):
+                self.cache = {}
+                self.lock = threading.Lock()
+                instances.append(self)
+            def lookup(self, ip):
+                return None
+        def sender(url, docs, *args, **kwargs):
+            self.assertNotIn("reverse_dns", docs[0]["destination"])
+            delivered.set()
+            return [True] * len(docs)
+        def ptr_sender(url, updates, *args, **kwargs):
+            self.assertEqual(len(updates), 1)
+            self.assertEqual(updates[0][1], {"destination": "late.example.test"})
+            followed.set()
+            return [True]
+        args = SimpleNamespace(db=self.path, url="https://localhost:9200",
+                               ca_file=None, client_cert=None, client_key=None,
+                               insecure=False, password_file=None, api_key_file=None,
+                               timeout=0.1, retry_delay=0.02, dns=True,
+                               bulk_size=100, index_prefix="conntrack-flows-test",
+                               max_flow_age=2592000)
+        stop = threading.Event()
+        with patch("flow_collector.make_opener", return_value=object()), patch(
+                "flow_collector.send_bulk_updates", side_effect=sender), patch(
+                "flow_collector.send_bulk_dns_updates", side_effect=ptr_sender), patch(
+                "flow_collector.DNSResolver", FakeResolver):
+            thread = threading.Thread(target=worker, args=(stop, args), daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(delivered.wait(2))
+                with instances[0].lock:
+                    instances[0].cache["198.51.100.20"] = ("late.example.test", time.monotonic() + 60)
+                self.assertTrue(followed.wait(2))
+                self.assertEqual(self.count(), 0)
+            finally:
+                stop.set()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
+    def test_slow_ptr_http_does_not_block_lifecycle_delivery(self):
+        self.insert("first")
+        first_delivered = threading.Event()
+        ptr_started = threading.Event()
+        release_ptr = threading.Event()
+        second_delivered = threading.Event()
+        instances = []
+        class FakeResolver:
+            def __init__(self, **kwargs):
+                self.cache = {}
+                self.lock = threading.Lock()
+                instances.append(self)
+            def lookup(self, ip):
+                return None
+        def sender(url, docs, *args, **kwargs):
+            if docs[0]["connection_id"] == "first":
+                first_delivered.set()
+            if docs[0]["connection_id"] == "second":
+                second_delivered.set()
+            return [True] * len(docs)
+        def ptr_sender(*args, **kwargs):
+            ptr_started.set()
+            release_ptr.wait(2)
+            return [True]
+        args = SimpleNamespace(db=self.path, url="https://localhost:9200",
+                               ca_file=None, client_cert=None, client_key=None,
+                               insecure=False, password_file=None, api_key_file=None,
+                               timeout=0.1, retry_delay=0.02, dns=True,
+                               bulk_size=100, index_prefix="conntrack-flows-test",
+                               max_flow_age=2592000)
+        stop = threading.Event()
+        with patch("flow_collector.make_opener", return_value=object()), patch(
+                "flow_collector.send_bulk_updates", side_effect=sender), patch(
+                "flow_collector.send_bulk_dns_updates", side_effect=ptr_sender), patch(
+                "flow_collector.DNSResolver", FakeResolver):
+            thread = threading.Thread(target=worker, args=(stop, args), daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(first_delivered.wait(2))
+                with instances[0].lock:
+                    instances[0].cache["198.51.100.20"] = ("late.example.test", time.monotonic() + 60)
+                self.assertTrue(ptr_started.wait(2))
+                self.insert("second")
+                self.assertTrue(second_delivered.wait(1), "PTR HTTP blocked lifecycle delivery")
+            finally:
+                release_ptr.set()
+                stop.set()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
 
     def test_failed_delivery_survives_worker_restart(self):
         self.insert()

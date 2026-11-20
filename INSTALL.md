@@ -1,4 +1,4 @@
-# Install the nlbwmon lifecycle collector (beta.2 development branch)
+# Install the nlbwmon lifecycle collector (RC candidate)
 
 **English** | [Русский](INSTALL.ru.md)
 
@@ -62,7 +62,7 @@ Check the listener and queue:
 
 ```sh
 ss -ltn | grep ':5517'
-python3 -c 'import sqlite3; c=sqlite3.connect("file:/opt/nlbwmon-data/flows.db?mode=ro",uri=True); print("events",c.execute("SELECT COUNT(*) FROM events").fetchone()[0],"dns_jobs",c.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0]); c.close()'
+python3 -c 'import sqlite3; c=sqlite3.connect("file:/opt/nlbwmon-data/flows.db?mode=ro",uri=True); print("events",c.execute("SELECT COUNT(*) FROM events").fetchone()[0],"dns_cache",c.execute("SELECT COUNT(*) FROM dns_cache").fetchone()[0]); c.close()'
 ```
 
 In OpenSearch Dashboards, inspect `conntrack-flows-*` with time field `flow.started_at`. Generate a controlled test connection: NEW creates `flow.status=active`; DESTROY updates the **same document** to `closed` with final counters. If DESTROY is lost, `active` can remain indefinitely. Monitor journal errors and SQLite queue depth; an increasing backlog may indicate OpenSearch failure, slow delivery, or authentication/mapping errors. Optional PTR creates extra OpenSearch updates.
