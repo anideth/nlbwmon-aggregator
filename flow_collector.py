@@ -111,6 +111,62 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def ptr_followup_worker(stop, args, resolver, pending_ptr, pending_lock, username, password, api_key):
+    """Independent, bounded best-effort PTR updates; never blocks lifecycle bulk."""
+    db = connect_db(args.db)
+    opener = make_opener(args.url, args.ca_file, args.client_cert, args.client_key, args.insecure)
+    try:
+        while not stop.is_set():
+            with pending_lock:
+                snapshot = list(pending_ptr.items())[:100]
+            updates = []
+            for key, (doc, deadline) in snapshot:
+                if time.monotonic() >= deadline:
+                    with pending_lock:
+                        if pending_ptr.get(key, (None, None))[0] is doc:
+                            pending_ptr.pop(key, None)
+                    continue
+                names = {}
+                for field in ("source", "destination"):
+                    if doc[field].get("reverse_dns"):
+                        continue
+                    ip = doc[field]["ip"]
+                    with resolver.lock:
+                        cached = resolver.cache.get(ip)
+                        hostname, until = cached if cached is not None and cached[1] > time.monotonic() else (None, 0)
+                    if cached is not None and until:
+                        db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                   (ip, hostname, time.time() + max(0, until - time.monotonic())))
+                    if hostname:
+                        names[field] = hostname
+                if names:
+                    updates.append((key, doc, names))
+            if updates:
+                try:
+                    results = send_bulk_dns_updates(args.url, [(doc, names) for _, doc, names in updates],
+                                                    username, password, args.timeout, opener, api_key,
+                                                    index_prefix=args.index_prefix)
+                    for (key, doc, names), success in zip(updates, results):
+                        if not success:
+                            continue
+                        for field, hostname in names.items():
+                            doc[field]["reverse_dns"] = hostname
+                        with resolver.lock:
+                            complete = all(doc[field].get("reverse_dns") or
+                                           (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic()
+                                            and resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
+                                           for field in ("source", "destination"))
+                        if complete:
+                            with pending_lock:
+                                if pending_ptr.get(key, (None, None))[0] is doc:
+                                    pending_ptr.pop(key, None)
+                except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+                    LOG.warning("PTR bulk followup failed (%s)", type(exc).__name__)
+            stop.wait(0.1 if snapshot else 0.5)
+    finally:
+        db.close()
+
+
 def worker(stop, args):
     """Ordered bulk delivery with durable, replay-safe SQLite outbox."""
     db = connect_db(args.db)
@@ -126,48 +182,15 @@ def worker(stop, args):
     last_prune = 0.0
     pending_ptr = {}  # bounded best-effort late PTR followups
     max_pending_ptr = 2000
+    pending_lock = threading.Lock()
+    ptr_thread = None
+    if resolver is not None:
+        ptr_thread = threading.Thread(target=ptr_followup_worker,
+                                      args=(stop, args, resolver, pending_ptr, pending_lock,
+                                            username, password, api_key), daemon=True)
+        ptr_thread.start()
     try:
         while not stop.is_set():
-            if resolver is not None and pending_ptr:
-                updates = []
-                for key, (doc, deadline) in list(pending_ptr.items())[:100]:
-                    if time.monotonic() >= deadline:
-                        pending_ptr.pop(key, None)
-                        continue
-                    names = {}
-                    for field in ("source", "destination"):
-                        if doc[field].get("reverse_dns"):
-                            continue
-                        ip = doc[field]["ip"]
-                        with resolver.lock:
-                            cached = resolver.cache.get(ip)
-                            hostname, until = cached if cached is not None and cached[1] > time.monotonic() else (None, 0)
-                        if cached is not None and until:
-                            db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
-                                       (ip, hostname, time.time() + max(0, until - time.monotonic())))
-                        if hostname:
-                            names[field] = hostname
-                    if names:
-                        updates.append((key, doc, names))
-                if updates:
-                    try:
-                        results = send_bulk_dns_updates(args.url, [(doc, names) for _, doc, names in updates],
-                                                        username, password, args.timeout, opener, api_key,
-                                                        index_prefix=args.index_prefix)
-                        for (key, doc, names), success in zip(updates, results):
-                            if not success:
-                                continue
-                            for field, hostname in names.items():
-                                doc[field]["reverse_dns"] = hostname
-                            with resolver.lock:
-                                complete = all(doc[field].get("reverse_dns") or
-                                               (resolver.cache.get(doc[field]["ip"], (None, 0))[1] > time.monotonic()
-                                                and resolver.cache.get(doc[field]["ip"], (None, 0))[0] is None)
-                                               for field in ("source", "destination"))
-                            if complete:
-                                pending_ptr.pop(key, None)
-                    except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as exc:
-                        LOG.warning("PTR bulk followup failed (%s)", type(exc).__name__)
             rows = db.execute("SELECT id,payload FROM events ORDER BY id LIMIT ?", (args.bulk_size,)).fetchall()
             if not rows:
                 stop.wait(0.5)
@@ -244,8 +267,9 @@ def worker(stop, args):
                                 continue
                             if any(doc[field]["ip"] not in known for field in ("source", "destination")):
                                 key = (doc["router_name"], doc["connection_id"])
-                                if key in pending_ptr or len(pending_ptr) < max_pending_ptr:
-                                    pending_ptr[key] = (doc, time.monotonic() + 30.0)
+                                with pending_lock:
+                                    if key in pending_ptr or len(pending_ptr) < max_pending_ptr:
+                                        pending_ptr[key] = (doc, time.monotonic() + 30.0)
                     LOG.info("bulk delivered=%d queued_from_id=%d", prefix, rows[0][0])
                 if prefix != len(rows):
                     LOG.warning("bulk partial failure at id=%d; retaining ordered suffix", rows[prefix][0])
@@ -261,6 +285,8 @@ def worker(stop, args):
                 LOG.error("bulk delivery failure (%s); batch retained", type(exc).__name__)
                 stop.wait(args.retry_delay)
     finally:
+        if ptr_thread is not None:
+            ptr_thread.join(timeout=args.timeout + 1)
         db.close()
 
 
