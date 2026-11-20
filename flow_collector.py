@@ -180,6 +180,7 @@ def dns_worker(stop, args):
     """Background PTR updates; DNS never blocks the event-delivery worker."""
     db = connect_db(args.db)
     resolver = DNSResolver(servers=getattr(args, 'dns_server', None), dns_timeout=getattr(args, 'dns_timeout', 1.5))
+    cache_pruned_at = 0.0
     # Keep the PTR scheduler independent from lifecycle delivery.
     opener = make_opener(args.url, args.ca_file, args.client_cert, args.client_key, args.insecure)
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
@@ -187,6 +188,9 @@ def dns_worker(stop, args):
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
     try:
         while not stop.is_set():
+            if time.monotonic() - cache_pruned_at >= 3600:
+                db.execute("DELETE FROM dns_cache WHERE expires_at <= ?", (time.time(),))
+                cache_pruned_at = time.monotonic()
             # A bounded queue still needs a due index: sorting the whole table
             # on each lookup is unacceptable under sustained load.
             row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
