@@ -130,6 +130,51 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.count(), 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0], 0)
 
+    def test_late_ptr_bulk_after_delivery(self):
+        self.insert("late-ptr")
+        delivered = threading.Event()
+        followed = threading.Event()
+        instances = []
+        class FakeResolver:
+            def __init__(self, **kwargs):
+                self.cache = {}
+                self.lock = threading.Lock()
+                instances.append(self)
+            def lookup(self, ip):
+                return None
+        def sender(url, docs, *args, **kwargs):
+            self.assertNotIn("reverse_dns", docs[0]["destination"])
+            delivered.set()
+            return [True] * len(docs)
+        def ptr_sender(url, updates, *args, **kwargs):
+            self.assertEqual(len(updates), 1)
+            self.assertEqual(updates[0][1], {"destination": "late.example.test"})
+            followed.set()
+            return [True]
+        args = SimpleNamespace(db=self.path, url="https://localhost:9200",
+                               ca_file=None, client_cert=None, client_key=None,
+                               insecure=False, password_file=None, api_key_file=None,
+                               timeout=0.1, retry_delay=0.02, dns=True,
+                               bulk_size=100, index_prefix="conntrack-flows-test",
+                               max_flow_age=2592000)
+        stop = threading.Event()
+        with patch("flow_collector.make_opener", return_value=object()), patch(
+                "flow_collector.send_bulk_updates", side_effect=sender), patch(
+                "flow_collector.send_bulk_dns_updates", side_effect=ptr_sender), patch(
+                "flow_collector.DNSResolver", FakeResolver):
+            thread = threading.Thread(target=worker, args=(stop, args), daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(delivered.wait(2))
+                with instances[0].lock:
+                    instances[0].cache["198.51.100.20"] = ("late.example.test", time.monotonic() + 60)
+                self.assertTrue(followed.wait(2))
+                self.assertEqual(self.count(), 0)
+            finally:
+                stop.set()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
     def test_failed_delivery_survives_worker_restart(self):
         self.insert()
         self.run_worker(OSError("offline"), wait=0.07)
