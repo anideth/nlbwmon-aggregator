@@ -188,13 +188,7 @@ def dns_worker(stop, args):
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
     try:
         while not stop.is_set():
-            # Legacy databases may contain millions of jobs without a due index.
-            # Never scan/sort the entire backlog on every DNS lookup.
-            has_due_index = db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='dns_jobs_due'").fetchone() is not None
-            if has_due_index:
-                row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
-            else:
-                row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs LIMIT 1").fetchone()
+            row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
             if row is None:
                 stop.wait(0.5)
                 continue
