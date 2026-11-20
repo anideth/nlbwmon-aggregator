@@ -55,6 +55,11 @@ def connect_db(path):
     columns = {row[1] for row in db.execute("PRAGMA table_info(dns_jobs)")}
     if "next_attempt" not in columns:
         db.execute("ALTER TABLE dns_jobs ADD COLUMN next_attempt REAL NOT NULL DEFAULT 0")
+    # New databases get the scheduling index immediately. On large existing
+    # databases build it during a planned maintenance window instead of
+    # blocking collector startup with a multi-million-row index build.
+    if db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0] < 100000:
+        db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
     return db
 
 
