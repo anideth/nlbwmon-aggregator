@@ -63,6 +63,15 @@ def parse_lifecycle(line):
             return None
         if kind == "NEW" and finished not in (0, started):
             return None
+        exporter = event.get("exporter_instance_id")
+        sequence = event.get("event_sequence")
+        if (exporter is None) != (sequence is None):
+            return None
+        if exporter is not None:
+            if not isinstance(exporter, str) or not 1 <= len(exporter) <= 128 or any(ord(c) < 33 for c in exporter):
+                return None
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= 18446744073709551615:
+                return None
         counts = {key: int(event[key]) for key in ("orig_packets", "orig_bytes", "reply_packets", "reply_bytes")}
         if any(v < 0 for v in counts.values()):
             return None
@@ -88,8 +97,12 @@ def parse_lifecycle(line):
                 flow["duration_ns"] = (finished - started) * 1000000000 + finished_ns - started_ns
             source.update(bytes=counts["orig_bytes"], packets=counts["orig_packets"])
             destination.update(bytes=counts["reply_bytes"], packets=counts["reply_packets"])
-        return {"router_name": router, "connection_id": connection, "event_type": kind,
-                "network": {"transport": PROTOCOLS[protocol_number]},
-                "source": source, "destination": destination, "flow": flow}
+        result = {"router_name": router, "connection_id": connection, "event_type": kind,
+                  "network": {"transport": PROTOCOLS[protocol_number]},
+                  "source": source, "destination": destination, "flow": flow}
+        if exporter is not None:
+            result["exporter"] = {"instance_id": exporter}
+            result["flow"]["new_sequence" if kind == "NEW" else "destroy_sequence"] = sequence
+        return result
     except (ValueError, KeyError, TypeError, OverflowError):
         return None
