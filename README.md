@@ -49,7 +49,7 @@ See [lifecycle semantics and fields](docs/LIFECYCLE_SETUP.md).
 
 ## SQLite, OpenSearch and delivery guarantees
 
-SQLite acts as a durable queue for events **already accepted** by the collector (WAL, `synchronous=FULL`) and for PTR jobs. Once committed, an event can survive collector restart and temporary OpenSearch outages. Events lost on the router or before SQLite commit cannot be recovered.
+SQLite acts as a durable queue for lifecycle events **already accepted** by the collector (WAL, `synchronous=FULL`). PTR results are cached per IP in SQLite (`dns_cache`), while late PTR follow-ups are bounded and kept in memory (up to 2,000 connections for 30 seconds). No per-flow `dns_jobs` are created. Late PTR enrichment can be missed after restart or overflow. Once committed, an event can survive collector restart and temporary OpenSearch outages. Events lost on the router or before SQLite commit cannot be recovered.
 
 The collector sends updates through the **OpenSearch Bulk API** using scripted document updates. OpenSearch must allow scripts, have `_source` enabled, and use correct mappings for `conntrack-flows-*`. The API relies on capabilities present since OpenSearch 1.0, but compatibility with every release has not been tested.
 
