@@ -9,7 +9,9 @@ The exporter does **not** persist intermediate conntrack UPDATE events or period
 
 **Current behavior:** a lost DESTROY leaves `flow.status=active` indefinitely (subject to index retention). No automatic seven-day timeout, stale status or reconciliation job exists in the code. Kernel conntrack expiry does not imply the collector received DESTROY.
 
-**Next-release proposal, not implemented:** configurable `--stale-timeout` default `604800` seconds (7 days), `--stale-check-interval` default `3600` seconds, `--stale-timeout 0` to disable, new `stale` status rather than falsely declaring `closed`, and `stale -> closed` on late DESTROY. Design must account for legitimately long-lived connections, update races and index retention; do not document these flags as runnable commands yet.
+**Beta.2:** `--max-flow-age 2592000` (seconds; 30 days by default) rejects NEW and DESTROY events whose `flow.started_at` is too old. The cutoff is evaluated when processing the durable SQLite outbox, including retries after an OpenSearch outage. Expired events are removed from the outbox without writing to OpenSearch; their count is logged. This does not change existing documents, create a `stale`/`expired` status, or manage ISM. `active` and `closed` remain the only stored statuses.
+
+> **IMPORTANT — retention configuration:** `--max-flow-age` MUST be strictly **less than** the minimum time a flow's destination daily index is retained by OpenSearch ISM. Leave extra margin for UTC daily index boundaries and ISM scheduling. In the validated lab, `--max-flow-age 2505600` (29 days) is paired with an ISM `min_index_age: 30d`. This is a **one-day nominal margin**, not a hard guarantee: index creation time, UTC boundaries and ISM execution timing matter. The collector does not read ISM policies; assess the margin for your deployment.
 
 ### SQLite persistence and OpenSearch requirements
 
@@ -83,6 +85,7 @@ PUT _index_template/conntrack-flows-template
       "dynamic": false,
       "properties": {
         "router_name": {"type": "keyword"},
+        "exporter": {"properties": {"instance_id": {"type": "keyword"}}},
         "connection_id": {"type": "keyword"},
         "event_type": {"type": "keyword"},
         "source": {"properties": {
@@ -102,15 +105,22 @@ PUT _index_template/conntrack-flows-template
         "network": {"properties": {"transport": {"type": "keyword"}}},
         "flow": {"properties": {
           "status": {"type": "keyword"},
-          "started_at": {"type": "date"},
-          "ended_at": {"type": "date"},
-          "duration_seconds": {"type": "long"}
+          "started_at": {"type": "date_nanos"},
+          "ended_at": {"type": "date_nanos"},
+          "duration_seconds": {"type": "long"},
+          "duration_ns": {"type": "long"},
+          "new_sequence": {"type": "long"},
+          "destroy_sequence": {"type": "long"}
         }}
       }
     }
   }
 }
 ```
+
+**Beta.2 sequence metadata:** the exporter includes `exporter_instance_id` (process identity) and monotonically increasing `event_sequence`. The collector indexes `exporter.instance_id` (keyword), `flow.new_sequence` and `flow.destroy_sequence` (long). Gaps are diagnostic; they do not by themselves prove Netlink loss. The close update preserves the NEW sequence.
+
+**Beta.2 timestamps:** `flow.started_at` and `flow.ended_at` must be `date_nanos`, and `flow.duration_ns` must be `long`. `_source` preserves nine fractional digits; Dashboards `fields` can display milliseconds depending on its output format. Verify the mapping and sort precision rather than judging only the formatted `fields` output. Existing `date` mappings cannot be changed in place: apply the updated template to **new** daily indices, leave existing data until retention, or recreate a disposable test index after stopping ingestion. Cross-midnight DESTROY targets the original UTC start-date index.
 
 `dynamic: false` is an optional strict-schema preference for new deployments; unknown fields remain in `_source` but are not indexed. If the existing template uses dynamic mappings, do not silently change that behavior. Replicas `0` is appropriate for a single-node lab, **not** a general production recommendation. The collector needs index creation privileges if daily indices do not already exist and auto-creation is enabled.
 
@@ -119,7 +129,7 @@ Inspect, simulate, and verify:
 GET _index_template/conntrack-flows-template
 POST _index_template/_simulate_index/conntrack-flows-2099.01.01
 GET conntrack-flows-*/_mapping
-GET conntrack-flows-*/_mapping/field/flow.started_at,flow.ended_at,flow.duration_seconds,router_name
+GET conntrack-flows-*/_mapping/field/flow.started_at,flow.ended_at,flow.duration_ns,flow.new_sequence,flow.destroy_sequence,exporter.instance_id
 ```
 
 Changing an index template affects **future** indices only; existing indices keep their mappings. Add compatible missing fields to existing indices using `PUT <specific-index>/_mapping` after inspecting the mapping; do not delete or recreate data casually. No need to precreate each daily index if auto-creation is permitted.
@@ -319,3 +329,37 @@ serially; it is best-effort and is not a throughput benchmark.
 A separate test collector and laboratory OpenWrt exporter were validated against an isolated `conntrack-flows-tests-*` namespace. OpenSearch returned two `NEW`/`active` documents and a `DESTROY`/`closed` document; a follow-up read confirmed that one of the previously active documents changed to `DESTROY`/`closed` **without changing `_id`**, with `_version=4`, 142-second duration, and final byte/packet counters. `GET _plugins/_ism/explain/<test-index>` confirmed `conntrack-flows-tests-retention` attached with `enabled=true`. This confirms the end-to-end functional lifecycle in one lab; it does **not** establish lossless delivery, recovery after outage/restart, or actual 30-day deletion. Real addresses, hostnames and connection identifiers are intentionally omitted.
 
 For isolated tests, configure `--index-prefix conntrack-flows-tests` and create a matching index template and retention policy before ingestion. Template selection priority and ISM policy priority are independent; where the test pattern overlaps `conntrack-flows-*`, give the test rules higher priorities and verify effective selection. The test index is created automatically on first successful write when OpenSearch auto-creation is permitted. A Dashboards data view (`conntrack-flows-tests-*`, time field `flow.started_at`) is **optional** and is not required for ingestion.
+
+## Beta.2 end-to-end validation (2026-11-20)
+
+A dedicated laboratory OpenWrt x86/64 router running the beta.2 exporter sent real TCP iperf3 NEW/DESTROY events to a separate Debian collector running `feature/beta2-timestamps-retention` (observed commit `e5bcca2`). The collector delivered Bulk scripted updates to the isolated `conntrack-flows-tests-*` OpenSearch namespace. One real connection transitioned from `NEW`/`active` to `DESTROY`/`closed` with **the same** `connection_id`, document `_id`, `flow.new_sequence=33`, `flow.destroy_sequence=34`, and final directional counters. The document version rose from 2 to 4 (versions also reflect PTR updates; they are not an event counter).
+
+Observed UTC timestamps were `2026-11-20T17:18:45.281768310Z` and `2026-11-20T17:19:05.383366146Z`. Their difference is exactly `flow.duration_ns=20101597836` (20.101597836 s); `flow.duration_seconds=20` is rounded. Mapping was independently checked: both timestamps are `date_nanos`, duration and sequence fields are `long`, and `exporter.instance_id` is `keyword`. The nanosecond Unix epoch sort value was observed, even though Dashboards' formatted `fields` displayed milliseconds.
+
+The test index used the higher-priority `conntrack-flows-tests-template` (priority 300) and an auto-attached `conntrack-flows-tests-retention` ISM policy (ISM template priority 200) with `hot → delete` at `min_index_age: 30d`. Policy attachment and hot-state operation were observed; **actual deletion after 30 days was not tested**. The collector was configured for 29-day max flow age (2,505,600 seconds) to leave a nominal one-day margin. No production indices or services were changed.
+
+**Remaining gates:** test outage/retry and collector restart, router/collector disconnect, duplicate and out-of-order event handling under real traffic, dropped Netlink/exporter events, backlog/throughput and memory over time, long-lived connections crossing UTC dates, and eventual ISM deletion. This validates core functionality, **not** exactly-once delivery or production readiness. Do not publish internal hostnames, IP addresses, real connection identifiers or credentials in test evidence.
+
+### Isolated beta.2 test index setup
+
+Use the same mapping as section 3, but set index template name `conntrack-flows-tests-template`, pattern `conntrack-flows-tests-*`, and template priority `300`. Set the collector's `--index-prefix conntrack-flows-tests`. Create a separate ISM policy `conntrack-flows-tests-retention` with `min_index_age: 30d` and `ism_template` pattern `conntrack-flows-tests-*` at priority `200`; this is independent of the composable template priority. Verify with:
+
+```http
+GET _index_template/conntrack-flows-tests-template
+POST _index_template/_simulate_index/conntrack-flows-tests-2099.01.01
+GET conntrack-flows-tests-*/_mapping/field/flow.started_at,flow.ended_at,flow.duration_ns,flow.new_sequence,flow.destroy_sequence,exporter.instance_id
+GET _plugins/_ism/policies/conntrack-flows-tests-retention
+GET _plugins/_ism/explain/conntrack-flows-tests-*
+```
+
+For a disposable lab index only, stop the collector **before** deleting/recreating a daily index; otherwise queued writes can immediately recreate it with the old template. Existing mappings are immutable; never delete production data merely to apply a template. Test the new mapping with a fresh NEW/DESTROY flow.
+
+## Beta.2 outage/restart recovery validation (2026-11-20)
+
+**Controlled isolated test, production unchanged.** On the dedicated test collector, the OpenSearch URL was temporarily changed to an unreachable local HTTPS endpoint, while the router-facing listener remained bound to the lab interface. The service stayed `active` and continued receiving events. Its SQLite `events` queue grew from **0 to 3** rows; the journal repeatedly reported `bulk delivery failure (URLError); batch retained` at roughly five-second intervals.
+
+With OpenSearch still unavailable, the collector was restarted using systemd. It returned to `active`; the queue then contained **4** rows. This is consistent with persistence across restart plus an additional incoming event, but individual SQLite row IDs were not recorded before/after restart, so strict per-row identity was not independently checked.
+
+The original OpenSearch URL was restored and the collector restarted. The operator observed that the SQLite queue drained completely and that events arrived in the isolated test index. A recovered TCP flow was observed as a `DESTROY`/`closed` document with final counters, `flow.new_sequence=41`, `flow.destroy_sequence=42`, nanosecond start/end timestamps and `flow.duration_ns=48280895800` (48.280895800 seconds). Its `_version=3` is not a duplicate counter; PTR enrichment may increment document versions.
+
+**Conclusion:** the lab demonstrates retry after OpenSearch connection failure, durable queue behavior across a collector restart, and successful eventual delivery of observed events. **Not yet demonstrated:** strict identity of all pre-restart queue rows, exhaustive duplicate suppression during retry/partial Bulk acknowledgement, lost router-side events, multi-hour outage under load, or exact-once end-to-end semantics. Do not publish actual router/client IP addresses, hostnames or connection identifiers in public evidence.

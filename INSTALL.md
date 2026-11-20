@@ -1,4 +1,4 @@
-# Install the nlbwmon lifecycle collector (v0.1.0-beta.1 source candidate)
+# Install the nlbwmon lifecycle collector (beta.2 development branch)
 
 **English** | [Русский](INSTALL.ru.md)
 
@@ -52,7 +52,7 @@ systemd-analyze verify /etc/systemd/system/flow-collector.service && systemctl d
 systemctl status flow-collector.service; journalctl -u flow-collector.service -n 100 --no-pager
 ```
 
-The example enables `--dns` (optional PTR) and uses `--password-file`. The code defaults to `--bulk-size 100` and `--max-events 100000`; tune only after measuring queue growth and OpenSearch throughput. **Never run two instances using the same SQLite database.** The service writes only under `/opt/nlbwmon-data`.
+The beta.2 example adds `--max-flow-age 2505600` (29 days), to be paired with a verified 30-day ISM policy. The default is 30 days; ensure the configured maximum is strictly shorter than actual index retention. The example enables `--dns` (optional PTR) and uses `--password-file`. The code defaults to `--bulk-size 100` and `--max-events 100000`; tune only after measuring queue growth and OpenSearch throughput. **Never run two instances using the same SQLite database.** The service writes only under `/opt/nlbwmon-data`.
 
 ## 5. Connect OpenWrt and verify
 
@@ -78,3 +78,7 @@ For detailed operational checks and backup guidance, see [FLOW_COLLECTOR_DEPLOYM
 ## Isolated test environment
 
 **Isolated testing on an existing OpenSearch cluster:** set `--index-prefix conntrack-flows-tests` on the test collector (default remains `conntrack-flows`). This changes **both lifecycle Bulk writes and asynchronous PTR updates** to `conntrack-flows-tests-YYYY.MM.DD`. Create a separate index template and least-privilege credentials restricted to `conntrack-flows-tests-*` before connecting the VM. Prefer separate least-privilege test credentials. If the lab reuses an existing writer credential, record the exception and verify index isolation; do not alter production templates.
+
+### Beta.2 validation
+
+The 2026-11-20 isolated lab test verified NEW→DESTROY in one document, stable connection identity, final counters, sequence fields and nanosecond timestamps with `date_nanos` mapping. See [the validation record and complete beta.2 index template](docs/LIFECYCLE_SETUP.md#beta2-end-to-end-validation-2026-11-20). These observations do not prove outage recovery or lossless delivery. The older `date` template must not be used for new beta.2 indices.

@@ -12,8 +12,9 @@ ROUTER = re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
 PROTOCOLS = {1: "icmp", 6: "tcp", 17: "udp", 58: "icmpv6"}
 
 
-def _iso(seconds):
-    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _iso(seconds, nanos=None):
+    base = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return f"{base}.{nanos:09d}Z" if nanos is not None else f"{base}.000Z"
 
 
 def parse_lifecycle(line):
@@ -47,12 +48,30 @@ def parse_lifecycle(line):
             return None
         started = int(event["started_sec"])
         finished = int(event["finished_sec"])
+        has_nanos = "started_nsec" in event and "finished_nsec" in event
+        if ("started_nsec" in event) != ("finished_nsec" in event):
+            return None
+        started_ns = int(event["started_nsec"]) if has_nanos else 0
+        finished_ns = int(event["finished_nsec"]) if has_nanos else 0
+        if not 0 <= started_ns < 1000000000 or not 0 <= finished_ns < 1000000000:
+            return None
         if not 0 < started < 253402300800:
             return None
         if kind == "DESTROY" and not started <= finished < 253402300800:
             return None
+        if kind == "DESTROY" and (finished - started) * 1000000000 + finished_ns - started_ns < 0:
+            return None
         if kind == "NEW" and finished not in (0, started):
             return None
+        exporter = event.get("exporter_instance_id")
+        sequence = event.get("event_sequence")
+        if (exporter is None) != (sequence is None):
+            return None
+        if exporter is not None:
+            if not isinstance(exporter, str) or not 1 <= len(exporter) <= 128 or any(ord(c) < 33 for c in exporter):
+                return None
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= 18446744073709551615:
+                return None
         counts = {key: int(event[key]) for key in ("orig_packets", "orig_bytes", "reply_packets", "reply_bytes")}
         if any(v < 0 for v in counts.values()):
             return None
@@ -69,14 +88,21 @@ def parse_lifecycle(line):
         if protocol_number in (6, 17):
             source["port"] = ports["orig_sport"]
             destination["port"] = ports["orig_dport"]
-        flow = {"status": "active" if kind == "NEW" else "closed", "started_at": _iso(started)}
+        flow = {"status": "active" if kind == "NEW" else "closed",
+                "started_at": _iso(started, started_ns if has_nanos else None)}
         if kind == "DESTROY":
-            flow["ended_at"] = _iso(finished)
+            flow["ended_at"] = _iso(finished, finished_ns if has_nanos else None)
             flow["duration_seconds"] = finished - started
+            if has_nanos:
+                flow["duration_ns"] = (finished - started) * 1000000000 + finished_ns - started_ns
             source.update(bytes=counts["orig_bytes"], packets=counts["orig_packets"])
             destination.update(bytes=counts["reply_bytes"], packets=counts["reply_packets"])
-        return {"router_name": router, "connection_id": connection, "event_type": kind,
-                "network": {"transport": PROTOCOLS[protocol_number]},
-                "source": source, "destination": destination, "flow": flow}
+        result = {"router_name": router, "connection_id": connection, "event_type": kind,
+                  "network": {"transport": PROTOCOLS[protocol_number]},
+                  "source": source, "destination": destination, "flow": flow}
+        if exporter is not None:
+            result["exporter"] = {"instance_id": exporter}
+            result["flow"]["new_sequence" if kind == "NEW" else "destroy_sequence"] = sequence
+        return result
     except (ValueError, KeyError, TypeError, OverflowError):
         return None

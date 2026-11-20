@@ -41,7 +41,7 @@ GET conntrack-flows-*/_mapping/field/source.ip,destination.ip,source.reverse_dns
 GET _cat/indices/conntrack-flows-*?v&h=index,docs.count,docs.deleted,pri.store.size
 ```
 
-The lifecycle event worker sends ordered batches through the OpenSearch Bulk API (default `--bulk-size 100`); only an acknowledged successful prefix is removed from SQLite, and a failed suffix remains queued. The service can accumulate a backlog if OpenSearch or DNS is unavailable. `--max-events` limits the primary event queue, not the `dns_jobs` table. No automatic stale-flow expiry or per-network CIDR exclusion is implemented at this revision. An `active` OpenSearch document is not proof that the conntrack entry is still alive.
+The lifecycle event worker sends ordered batches through the OpenSearch Bulk API (default `--bulk-size 100`); only an acknowledged successful prefix is removed from SQLite, and a failed suffix remains queued. The service can accumulate a backlog if OpenSearch or DNS is unavailable. `--max-events` limits the primary event queue, not the `dns_jobs` table. Beta.2 adds `--max-flow-age` filtering of events by flow start time when processing the SQLite outbox (default 30 days); use 29 days (`2505600`) only when the ISM retention and timing margin have been reviewed. This does not expire existing `active` documents. No per-network CIDR exclusion is implemented. An `active` OpenSearch document is not proof that the conntrack entry is still alive.
 
 ## Upgrade and rollback
 
@@ -52,3 +52,7 @@ Before upgrades, record `git rev-parse HEAD`, back up the existing unit and a **
 A real router has produced live NEW records with PTR names and a live workstation TCP connection was independently confirmed by `ss`. Index size after more than 12 hours was reported at approximately 400 MB; one-day ~1 GB is an estimate, not a benchmark. The complete chain's CPU, RSS, throughput, dropped events, backlog growth, and prolonged DESTROY completeness are not yet quantified.
 
 **Beta release gate:** audit code/license provenance, verify license and code provenance, test clean installation on a new Debian VM, verify no credentials or private IPs in examples, test rollback and controlled NEW/DESTROY with DNS enabled, and verify OpenSearch mappings. Only then tag the tested commit and publish a GitHub prerelease. The tag alone is not a deployment validation.
+
+## Beta.2 verification update (2026-11-20)
+
+An isolated end-to-end test confirmed stable `_id` through NEW/DESTROY, precise `flow.duration_ns`, `date_nanos` mapping, exporter instance and event sequences, and final counters. The index template must map `flow.started_at` and `flow.ended_at` as `date_nanos`, `flow.duration_ns` and both sequence fields as `long`, and `exporter.instance_id` as `keyword`. The full template, test-index instructions and remaining resilience checks are in [LIFECYCLE_SETUP.md](LIFECYCLE_SETUP.md#beta2-end-to-end-validation-2026-11-20). Existing indices retain their original mapping; update templates for future indices or recreate **only disposable test** indices after stopping ingestion.

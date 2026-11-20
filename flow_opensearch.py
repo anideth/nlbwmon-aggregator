@@ -17,10 +17,12 @@ if (ctx.op == 'create') {
   if (ctx._source.flow.status == 'closed' || params.doc.event_type == 'NEW') {
     ctx.op = 'none';
   } else if (params.doc.event_type == 'DESTROY') {
+    def newSequence = ctx._source.flow == null ? null : ctx._source.flow.new_sequence;
     def sourceDns = ctx._source.source == null ? null : ctx._source.source.reverse_dns;
     def destinationDns = ctx._source.destination == null ? null : ctx._source.destination.reverse_dns;
     ctx._source.putAll(params.doc);
     ctx._source.flow = params.doc.flow;
+    if (newSequence != null) { ctx._source.flow.new_sequence = newSequence; }
     if (sourceDns != null) { ctx._source.source.reverse_dns = sourceDns; }
     if (destinationDns != null) { ctx._source.destination.reverse_dns = destinationDns; }
   } else {

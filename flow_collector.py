@@ -14,6 +14,7 @@ import socketserver
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 
 from flow_lifecycle import parse_lifecycle
@@ -22,6 +23,18 @@ from flow_writer import make_opener, read_secret, send_bulk_updates, send_dns_up
 from dns_resolver import DNSResolver
 
 LOG = logging.getLogger("flow-collector")
+
+
+def is_expired(doc, max_flow_age, now=None):
+    """Expire by flow start, not ingress time; do not restore retained-out indexes."""
+    if max_flow_age <= 0:
+        raise ValueError("max_flow_age must be positive")
+    started = datetime.fromisoformat(doc["flow"]["started_at"].replace("Z", "+00:00"))
+    if started.tzinfo is None:
+        raise ValueError("started_at must have timezone")
+    current = time.time() if now is None else now
+    return current - started.timestamp() >= max_flow_age
+
 
 
 def connect_db(path):
@@ -107,8 +120,15 @@ def worker(stop, args):
                 continue
             try:
                 docs = [json.loads(payload) for _, payload in rows]
-                successes = send_bulk_updates(args.url, docs, username, password,
-                                              args.timeout, opener, api_key, index_prefix=args.index_prefix)
+                expired = [is_expired(doc, args.max_flow_age) for doc in docs]
+                fresh = [doc for doc, old in zip(docs, expired) if not old]
+                sent = (send_bulk_updates(args.url, fresh, username, password,
+                                          args.timeout, opener, api_key, index_prefix=args.index_prefix)
+                        if fresh else [])
+                sent_iter = iter(sent)
+                successes = [True if old else next(sent_iter, False) for old in expired]
+                if any(expired):
+                    LOG.warning("flow events discarded by max-flow-age: %d", sum(expired))
                 # A failed item blocks all later items, even if OpenSearch accepted
                 # them. Replaying later items is safe: the update script is monotonic
                 # (closed never reopens) and repeated NEW/DESTROY is a noop.
@@ -119,8 +139,8 @@ def worker(stop, args):
                     prefix += 1
                 if prefix:
                     db.execute("BEGIN IMMEDIATE")
-                    for (ident, payload), doc in zip(rows[:prefix], docs[:prefix]):
-                        if getattr(args, "dns", False):
+                    for (ident, payload), doc, old in zip(rows[:prefix], docs[:prefix], expired[:prefix]):
+                        if not old and getattr(args, "dns", False):
                             db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO UPDATE SET payload=excluded.payload",
                                        (doc["router_name"], doc["connection_id"], payload))
                         db.execute("DELETE FROM events WHERE id=?", (ident,))
@@ -159,6 +179,11 @@ def dns_worker(stop, args):
                 continue
             router, connection, payload = row
             doc = json.loads(payload)
+            if is_expired(doc, args.max_flow_age):
+                db.execute("DELETE FROM dns_jobs WHERE router_name=? AND connection_id=? AND payload=?",
+                           (router, connection, payload))
+                LOG.warning("expired PTR job discarded")
+                continue
             names = {}
             ready = True
             for field in ("source", "destination"):
@@ -200,6 +225,7 @@ def main():
     ap.add_argument("--db", required=True)
     ap.add_argument("--max-events", type=int, default=100000)
     ap.add_argument("--bulk-size", type=int, default=100)
+    ap.add_argument("--max-flow-age", type=int, default=2592000, help="maximum age in seconds since flow start; must be below index retention (default: 30 days)")
     ap.add_argument("--index-prefix", default="conntrack-flows", help="OpenSearch index namespace (default: conntrack-flows)")
     ap.add_argument("--url", required=True)
     ap.add_argument("--ca-file")
@@ -219,7 +245,7 @@ def main():
     u = urlsplit(args.url)
     if u.scheme not in ("http", "https") or not u.netloc or u.username is not None or u.password is not None or u.path not in ("", "/") or u.query or u.fragment:
         ap.error("invalid OpenSearch URL")
-    if args.max_events <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
+    if args.max_flow_age <= 0 or args.max_events <= 0 or not 1 <= args.bulk_size <= 1000 or args.timeout <= 0 or args.retry_delay <= 0 or args.dns_timeout <= 0:
         ap.error("invalid queue or retry parameters")
     try:
         validate_index_prefix(args.index_prefix)
