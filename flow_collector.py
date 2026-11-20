@@ -52,6 +52,7 @@ def connect_db(path):
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS events_identity ON events(router_name, connection_id, event_type)")
     db.execute("CREATE TABLE IF NOT EXISTS dns_jobs (router_name TEXT NOT NULL, connection_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(router_name,connection_id))")
+    db.execute("CREATE TABLE IF NOT EXISTS dns_cache (ip TEXT PRIMARY KEY, hostname TEXT, expires_at REAL NOT NULL)")
     columns = {row[1] for row in db.execute("PRAGMA table_info(dns_jobs)")}
     if "next_attempt" not in columns:
         db.execute("ALTER TABLE dns_jobs ADD COLUMN next_attempt REAL NOT NULL DEFAULT 0")
@@ -203,13 +204,24 @@ def dns_worker(stop, args):
             ready = True
             for field in ("source", "destination"):
                 ip = doc[field]["ip"]
+                now = time.time()
+                cached_db = db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?", (ip, now)).fetchone()
+                if cached_db is not None:
+                    if cached_db[0]:
+                        names[field] = cached_db[0]
+                    continue
                 resolver.lookup(ip)
                 with resolver.lock:
                     cached = resolver.cache.get(ip)
                     if cached is None or cached[1] <= time.monotonic():
                         ready = False
-                    elif cached[0]:
-                        names[field] = cached[0]
+                    else:
+                        hostname, deadline = cached
+                        remaining = max(0.0, deadline - time.monotonic())
+                        db.execute("INSERT INTO dns_cache(ip,hostname,expires_at) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET hostname=excluded.hostname,expires_at=excluded.expires_at",
+                                   (ip, hostname, time.time() + remaining))
+                        if hostname:
+                            names[field] = hostname
             if not ready:
                 db.execute("UPDATE dns_jobs SET next_attempt=? WHERE router_name=? AND connection_id=? AND payload=?", (time.time() + 0.5, router, connection, payload))
                 continue
