@@ -1,4 +1,4 @@
-# Установка коллектора nlbwmon (ветка разработки beta.2)
+# Установка коллектора nlbwmon (кандидат RC)
 
 [English](INSTALL.md) | **Русский**
 
@@ -62,7 +62,7 @@ systemctl status flow-collector.service; journalctl -u flow-collector.service -n
 
 ```sh
 ss -ltn | grep ':5517'
-python3 -c 'import sqlite3; c=sqlite3.connect("file:/opt/nlbwmon-data/flows.db?mode=ro",uri=True); print("events",c.execute("SELECT COUNT(*) FROM events").fetchone()[0],"dns_jobs",c.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0]); c.close()'
+python3 -c 'import sqlite3; c=sqlite3.connect("file:/opt/nlbwmon-data/flows.db?mode=ro",uri=True); print("events",c.execute("SELECT COUNT(*) FROM events").fetchone()[0],"dns_cache",c.execute("SELECT COUNT(*) FROM dns_cache").fetchone()[0]); c.close()'
 ```
 
 В OpenSearch Dashboards откройте `conntrack-flows-*` с полем времени `flow.started_at`. Создайте тестовое соединение: NEW создаёт документ `flow.status=active`, DESTROY обновляет **тот же документ** до `closed` с итоговыми счётчиками. Если DESTROY потерян, `active` может остаться навсегда. Следите за ошибками в journal и размером очереди SQLite: рост очереди может означать недоступность OpenSearch, низкую скорость записи или ошибки авторизации/mapping. PTR при включении создаёт дополнительные обновления OpenSearch.
