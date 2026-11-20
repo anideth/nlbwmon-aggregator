@@ -181,13 +181,20 @@ def dns_worker(stop, args):
     """Background PTR updates; DNS never blocks the event-delivery worker."""
     db = connect_db(args.db)
     resolver = DNSResolver(servers=getattr(args, 'dns_server', None), dns_timeout=getattr(args, 'dns_timeout', 1.5))
+    # Keep the PTR scheduler independent from lifecycle delivery.
     opener = make_opener(args.url, args.ca_file, args.client_cert, args.client_key, args.insecure)
     password = read_secret(args.password_file) if args.password_file else os.environ.get("OPENSEARCH_PASSWORD")
     username = os.environ.get("OPENSEARCH_USER")
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
     try:
         while not stop.is_set():
-            row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
+            # Legacy databases may contain millions of jobs without a due index.
+            # Never scan/sort the entire backlog on every DNS lookup.
+            has_due_index = db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='dns_jobs_due'").fetchone() is not None
+            if has_due_index:
+                row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
+            else:
+                row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs LIMIT 1").fetchone()
             if row is None:
                 stop.wait(0.5)
                 continue
