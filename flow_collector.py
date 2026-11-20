@@ -56,11 +56,9 @@ def connect_db(path):
     columns = {row[1] for row in db.execute("PRAGMA table_info(dns_jobs)")}
     if "next_attempt" not in columns:
         db.execute("ALTER TABLE dns_jobs ADD COLUMN next_attempt REAL NOT NULL DEFAULT 0")
-    # New databases get the scheduling index immediately. On large existing
-    # databases build it during a planned maintenance window instead of
-    # blocking collector startup with a multi-million-row index build.
-    if os.path.getsize(path) < 64 * 1024 * 1024:
-        db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
+    # Existing large queues must be drained or cleared before upgrading.
+    # The due index prevents a full sort on every PTR job.
+    db.execute("CREATE INDEX IF NOT EXISTS dns_jobs_due ON dns_jobs(next_attempt)")
     return db
 
 
@@ -189,6 +187,8 @@ def dns_worker(stop, args):
     api_key = read_secret(args.api_key_file) if args.api_key_file else None
     try:
         while not stop.is_set():
+            # A bounded queue still needs a due index: sorting the whole table
+            # on each lookup is unacceptable under sustained load.
             row = db.execute("SELECT router_name,connection_id,payload FROM dns_jobs WHERE next_attempt <= ? ORDER BY next_attempt LIMIT 1", (time.time(),)).fetchone()
             if row is None:
                 stop.wait(0.5)
