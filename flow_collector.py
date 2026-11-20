@@ -154,7 +154,14 @@ def worker(stop, args):
                             if time.monotonic() - dns_jobs_checked_at >= 60:
                                 dns_jobs_estimate = db.execute("SELECT COUNT(*) FROM dns_jobs").fetchone()[0]
                                 dns_jobs_checked_at = time.monotonic()
-                            if dns_jobs_estimate < args.max_dns_jobs:
+                            # Negative PTR results are useful: avoid creating a
+                            # per-connection job when neither endpoint can have
+                            # an enrichment. Expired entries count as cache misses.
+                            ips = (doc["source"]["ip"], doc["destination"]["ip"])
+                            cached = [db.execute("SELECT hostname FROM dns_cache WHERE ip=? AND expires_at>?",
+                                                 (ip, time.time())).fetchone() for ip in ips]
+                            both_negative = all(entry is not None and entry[0] is None for entry in cached)
+                            if not both_negative and dns_jobs_estimate < getattr(args, "max_dns_jobs", 100000):
                                 cursor = db.execute("INSERT INTO dns_jobs(router_name,connection_id,payload) VALUES(?,?,?) ON CONFLICT(router_name,connection_id) DO NOTHING",
                                                     (doc["router_name"], doc["connection_id"], payload))
                                 dns_jobs_estimate += cursor.rowcount
