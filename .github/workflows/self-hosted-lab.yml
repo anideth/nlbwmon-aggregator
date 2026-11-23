@@ -1,0 +1,24 @@
+name: Self-hosted lab checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python checks (lab runner)
+    runs-on: [self-hosted, Linux, X64, vm-d01test, build-test]
+    timeout-minutes: 10
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Show interpreter
+        run: python3 --version
+      - name: Compile Python sources
+        run: python3 -m compileall -q -f aggregator.py dns_resolver.py flow_collector.py flow_lifecycle.py flow_opensearch.py flow_state.py flow_writer.py
+      - name: Run unit tests
+        run: python3 -m unittest discover -v
